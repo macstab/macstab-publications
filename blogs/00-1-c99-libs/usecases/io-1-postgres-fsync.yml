@@ -1,0 +1,57 @@
+# io · use-case 1 — Postgres WAL fdatasync() → EIO → PANIC / crash recovery.
+# Full L10 write-up (what / how / why-nobody-else / how-we): see usecases/README.md §io-1.
+#   run:  docker compose -f usecases/io-1-postgres-fsync.yml up --abort-on-container-exit
+#   watch postgres logs for: "could not fdatasync file ... : Input/output error" / PANIC
+name: chaos-io-1
+services:
+  fetch:                                   # download the released .so for this arch (amd64/arm64), verify SHA
+    image: alpine:3.20
+    environment:
+      CHAOS_VERSION: ${CHAOS_VERSION:-1.0.0}
+    volumes: [ "chaoslibs:/libs" ]
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache wget ca-certificates >/dev/null
+        ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        B="https://github.com/macstab/macstab-chaos-testing-libraries/releases/download/$$CHAOS_VERSION"
+        cd /libs
+        wget -q "$$B/libchaos-io-glibc-$$ARCH.so" "$$B/SHA256SUMS"
+        sha256sum -c SHA256SUMS --ignore-missing 2>&1 | grep "libchaos-io-glibc-$$ARCH.so: OK"
+        cp "libchaos-io-glibc-$$ARCH.so" libchaos-io.so
+        echo "fetched libchaos-io ($$ARCH, glibc) — checksum OK"
+
+  postgres:
+    image: postgres:16-bookworm
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+    environment:
+      POSTGRES_PASSWORD: chaos
+    volumes: [ "chaoslibs:/libs:ro" ]
+    # gosu is setuid → AT_SECURE strips LD_PRELOAD. Drop privilege with setpriv (capability-based) instead.
+    entrypoint:
+      - bash
+      - -c
+      - |
+        printf '/var/lib/postgresql/data/pg_wal:fdatasync:EIO:0.05\n' > /tmp/.chaos-io.conf
+        export LD_PRELOAD=/libs/libchaos-io.so
+        exec setpriv --reuid=postgres --regid=postgres --init-groups \
+          docker-entrypoint.sh postgres -c checkpoint_timeout=30s -c max_wal_size=48MB
+
+  client:                                  # write workload → forces WAL + checkpoints so the fault fires
+    image: postgres:16-bookworm
+    depends_on: [ postgres ]
+    environment:
+      PGPASSWORD: chaos
+    entrypoint:
+      - bash
+      - -c
+      - |
+        until pg_isready -h postgres -U postgres; do sleep 1; done
+        psql -h postgres -U postgres -c 'create table t(id serial, v text)'
+        while psql -h postgres -U postgres -q -c "insert into t(v) values (repeat('x',512))"; do :; done
+        echo "DB ERROR — the injected WAL fsync fault surfaced"
+
+volumes:
+  chaoslibs: {}

@@ -1,0 +1,52 @@
+# dns · use-case 1 — silently reroute a hostname to a canary (REWRITE), before a packet leaves.
+# Full L10 write-up: usecases/README.md §dns-1.
+#   run:  docker compose -f usecases/dns-1-rewrite-canary.yml up --abort-on-container-exit
+#   watch for: "asked for primary, reached: CANARY"
+name: chaos-dns-1
+services:
+  fetch:
+    image: alpine:3.20
+    environment:
+      CHAOS_VERSION: ${CHAOS_VERSION:-1.0.0}
+    volumes: [ "chaoslibs:/libs" ]
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache wget ca-certificates >/dev/null
+        ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        B="https://github.com/macstab/macstab-chaos-testing-libraries/releases/download/$$CHAOS_VERSION"
+        cd /libs
+        wget -q "$$B/libchaos-dns-glibc-$$ARCH.so" "$$B/SHA256SUMS"
+        sha256sum -c SHA256SUMS --ignore-missing 2>&1 | grep "libchaos-dns-glibc-$$ARCH.so: OK"
+        cp "libchaos-dns-glibc-$$ARCH.so" libchaos-dns.so
+
+  primary:
+    image: nginx:bookworm
+    entrypoint: ["bash","-c","echo PRIMARY > /usr/share/nginx/html/index.html; exec nginx -g 'daemon off;'"]
+  canary:
+    image: nginx:bookworm
+    entrypoint: ["bash","-c","echo CANARY > /usr/share/nginx/html/index.html; exec nginx -g 'daemon off;'"]
+
+  client:
+    image: python:3.12-slim-bookworm
+    depends_on:
+      fetch:   { condition: service_completed_successfully }
+      primary: { condition: service_started }
+      canary:  { condition: service_started }
+    volumes: [ "chaoslibs:/libs:ro" ]
+    command:
+      - bash
+      - -c
+      - |
+        printf 'dns://primary:REWRITE:canary\n' > /tmp/.chaos-dns.conf
+        cat > /app.py <<'PY'
+        import urllib.request
+        body = urllib.request.urlopen("http://primary/", timeout=5).read().decode().strip()
+        print(f"asked for primary, reached: {body}")
+        PY
+        sleep 3
+        exec env LD_PRELOAD=/libs/libchaos-dns.so python3 /app.py
+
+volumes:
+  chaoslibs: {}

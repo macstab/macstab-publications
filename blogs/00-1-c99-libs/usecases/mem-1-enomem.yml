@@ -1,0 +1,50 @@
+# memory · use-case 1 — anonymous mmap() returns ENOMEM (the arena -Xmx can't reach).
+# Full L10 write-up: usecases/README.md §mem-1.
+#   run:  docker compose -f usecases/mem-1-enomem.yml up --abort-on-container-exit
+#   watch for: "mmap(anon) FAILED: [errno 12] Cannot allocate memory"
+name: chaos-mem-1
+services:
+  fetch:
+    image: alpine:3.20
+    environment:
+      CHAOS_VERSION: ${CHAOS_VERSION:-1.0.0}
+    volumes: [ "chaoslibs:/libs" ]
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache wget ca-certificates >/dev/null
+        ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        B="https://github.com/macstab/macstab-chaos-testing-libraries/releases/download/$$CHAOS_VERSION"
+        cd /libs
+        wget -q "$$B/libchaos-memory-glibc-$$ARCH.so" "$$B/SHA256SUMS"
+        sha256sum -c SHA256SUMS --ignore-missing 2>&1 | grep "libchaos-memory-glibc-$$ARCH.so: OK"
+        cp "libchaos-memory-glibc-$$ARCH.so" libchaos-memory.so
+
+  app:
+    image: gcc:bookworm
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+    volumes: [ "chaoslibs:/libs:ro" ]
+    command:
+      - bash
+      - -c
+      - |
+        printf 'mmap/anon:ERRNO:ENOMEM\n' > /tmp/.chaos-memory.conf
+        cat > /p.c <<'C'
+        #include <stdio.h>
+        #include <errno.h>
+        #include <string.h>
+        #include <sys/mman.h>
+        int main(void){
+          void *p = mmap(NULL, 4<<20, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+          if (p == MAP_FAILED) printf("mmap(anon) FAILED: [errno %d] %s\n", errno, strerror(errno));
+          else                 printf("mmap ok at %p\n", p);
+          return 0;
+        }
+        C
+        gcc -O2 -o /p /p.c
+        exec env LD_PRELOAD=/libs/libchaos-memory.so /p
+
+volumes:
+  chaoslibs: {}

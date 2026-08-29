@@ -1,0 +1,52 @@
+# net · use-case 1 — the client's connect() to a HEALTHY Redis is refused (per-endpoint).
+# Full L10 write-up: usecases/README.md §net-1.
+#   run:  docker compose -f usecases/net-1-redis-refused.yml up --abort-on-container-exit
+#   watch for: "connect -> [Errno 111] Connection refused" while redis is up
+name: chaos-net-1
+services:
+  fetch:
+    image: alpine:3.20
+    environment:
+      CHAOS_VERSION: ${CHAOS_VERSION:-1.0.0}
+    volumes: [ "chaoslibs:/libs" ]
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache wget ca-certificates >/dev/null
+        ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        B="https://github.com/macstab/macstab-chaos-testing-libraries/releases/download/$$CHAOS_VERSION"
+        cd /libs
+        wget -q "$$B/libchaos-net-glibc-$$ARCH.so" "$$B/SHA256SUMS"
+        sha256sum -c SHA256SUMS --ignore-missing 2>&1 | grep "libchaos-net-glibc-$$ARCH.so: OK"
+        cp "libchaos-net-glibc-$$ARCH.so" libchaos-net.so
+
+  redis:
+    image: redis:7-bookworm
+
+  client:
+    image: python:3.12-slim-bookworm
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+      redis: { condition: service_started }
+    volumes: [ "chaoslibs:/libs:ro" ]
+    command:
+      - bash
+      - -c
+      - |
+        printf 'tcp4://*:6379:connect:ECONNREFUSED:1.0\n' > /tmp/.chaos-net.conf
+        cat > /app.py <<'PY'
+        import socket
+        for i in range(5):
+            s = socket.socket()
+            try:
+                s.connect(("redis", 6379)); print(f"try {i}: connected")
+            except OSError as e:
+                print(f"try {i}: connect -> [Errno {e.errno}] {e.strerror}")
+            finally:
+                s.close()
+        PY
+        exec env LD_PRELOAD=/libs/libchaos-net.so python3 /app.py
+
+volumes:
+  chaoslibs: {}

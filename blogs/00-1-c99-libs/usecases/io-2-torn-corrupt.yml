@@ -1,0 +1,48 @@
+# io · use-case 2 — silent data corruption: single-bit-flip on read (CORRUPT).
+# Full L10 write-up: usecases/README.md §io-2.
+#   run:  docker compose -f usecases/io-2-torn-corrupt.yml up --abort-on-container-exit
+#   watch for: "CHECKSUM MISMATCH — silent corruption detected"
+name: chaos-io-2
+services:
+  fetch:
+    image: alpine:3.20
+    environment:
+      CHAOS_VERSION: ${CHAOS_VERSION:-1.0.0}
+    volumes: [ "chaoslibs:/libs" ]
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache wget ca-certificates >/dev/null
+        ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        B="https://github.com/macstab/macstab-chaos-testing-libraries/releases/download/$$CHAOS_VERSION"
+        cd /libs
+        wget -q "$$B/libchaos-io-glibc-$$ARCH.so" "$$B/SHA256SUMS"
+        sha256sum -c SHA256SUMS --ignore-missing 2>&1 | grep "libchaos-io-glibc-$$ARCH.so: OK"
+        cp "libchaos-io-glibc-$$ARCH.so" libchaos-io.so
+
+  app:
+    image: python:3.12-slim-bookworm
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+    volumes: [ "chaoslibs:/libs:ro" ]
+    command:
+      - bash
+      - -c
+      - |
+        mkdir -p /data
+        printf '/data:read:CORRUPT:0.5\n' > /tmp/.chaos-io.conf
+        cat > /app.py <<'PY'
+        import hashlib, os
+        payload = os.urandom(4096)
+        digest  = hashlib.sha256(payload).hexdigest()
+        open('/data/record.bin','wb').write(payload)
+        for i in range(20):
+            got = open('/data/record.bin','rb').read()
+            ok  = hashlib.sha256(got).hexdigest() == digest
+            print(f"read {i:2d}: {'OK' if ok else 'CHECKSUM MISMATCH — silent corruption detected'}")
+        PY
+        exec env LD_PRELOAD=/libs/libchaos-io.so python3 /app.py
+
+volumes:
+  chaoslibs: {}

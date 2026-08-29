@@ -1,0 +1,47 @@
+# process · use-case 2 — execve()/posix_spawn() blocked (EACCES) → child dies, PARENT survives.
+# Full L10 write-up: usecases/README.md §proc-2.
+#   run:  docker compose -f usecases/proc-2-subprocess-blocked.yml up --abort-on-container-exit
+#   watch for: "subprocess blocked: [Errno 13] Permission denied" AND "parent still running"
+name: chaos-proc-2
+services:
+  fetch:
+    image: alpine:3.20
+    environment:
+      CHAOS_VERSION: ${CHAOS_VERSION:-1.0.0}
+    volumes: [ "chaoslibs:/libs" ]
+    command:
+      - sh
+      - -ec
+      - |
+        apk add --no-cache wget ca-certificates >/dev/null
+        ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+        B="https://github.com/macstab/macstab-chaos-testing-libraries/releases/download/$$CHAOS_VERSION"
+        cd /libs
+        wget -q "$$B/libchaos-process-glibc-$$ARCH.so" "$$B/SHA256SUMS"
+        sha256sum -c SHA256SUMS --ignore-missing 2>&1 | grep "libchaos-process-glibc-$$ARCH.so: OK"
+        cp "libchaos-process-glibc-$$ARCH.so" libchaos-process.so
+
+  app:
+    image: python:3.12-slim-bookworm
+    depends_on:
+      fetch: { condition: service_completed_successfully }
+    volumes: [ "chaoslibs:/libs:ro" ]
+    command:
+      - bash
+      - -c
+      - |
+        # Hook BOTH exec paths: CPython 3.12 subprocess may use posix_spawn instead of fork+execve.
+        printf 'execve:ERRNO:EACCES\nposix_spawn:ERRNO:EACCES\nposix_spawnp:ERRNO:EACCES\n' > /tmp/.chaos-process.conf
+        cat > /app.py <<'PY'
+        import subprocess
+        try:
+            subprocess.run(["/bin/echo", "hello from child"], check=True)
+            print("subprocess ran")
+        except OSError as e:
+            print(f"subprocess blocked: [Errno {e.errno}] {e.strerror}")
+        print("parent still running — execve was blocked, the process survived")
+        PY
+        exec env LD_PRELOAD=/libs/libchaos-process.so python3 /app.py
+
+volumes:
+  chaoslibs: {}
