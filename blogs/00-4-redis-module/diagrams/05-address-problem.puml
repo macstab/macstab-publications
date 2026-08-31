@@ -1,0 +1,40 @@
+@startuml redis-05-address-problem
+!include _style.iuml
+title The address problem — Sentinel is **discovery**, not a proxy
+
+rectangle "  ✅  Linux host  ·  dev container  ·  CI container  " as LINUX #10210f {
+  rectangle "Test JVM" as J1
+  rectangle "sentinel1\nhost:26379 (mapped)" as SL
+  rectangle "master\n**172.18.0.2:6379**" as ML #1c2a1c
+
+  J1 -[#9ece6a]-> SL : ① get-master-addr-by-name
+  SL -[#9ece6a]-> J1 : ② replies **"172.18.0.2" "6379"**
+  J1 -[#9ece6a]-> ML : ③ connect 172.18.0.2:6379\n**routable — the bridge is a real host interface**
+}
+
+rectangle "  ❌  macOS / Windows host  ·  Docker Desktop  " as MAC #21100f {
+  rectangle "Test JVM " as J2
+  rectangle "── Linux VM boundary ──" as VM #0f141a {
+    rectangle "sentinel1\nlocalhost:54873 (mapped)" as SM
+    rectangle "master \n**172.18.0.2:6379**" as MM #1c2a1c
+  }
+
+  J2 -[#9ece6a]-> SM : ① get-master-addr-by-name
+  SM -[#9ece6a]-> J2 : ② replies **"172.18.0.2" "6379"**
+  J2 -[#f7768e]-> MM : ③ connect 172.18.0.2:6379\n**<color:#f7768e>NO ROUTE — the subnet lives inside the VM</color>**
+}
+
+LINUX -[hidden]down-> MAC
+
+legend bottom
+  <b><color:#f7768e>The Sentinel handshake succeeds — then the second hop dies.</color></b>
+  A maximally confusing failure, so the module refuses to run it: <b>@DisabledOnNonLinuxHost</b> tests
+  <b>/.dockerenv</b> first (a dev container on macOS still reports os.name = "Mac OS X"), then os.name.
+  On macOS the result is <b><color:#9ece6a>SKIPPED, with the reason printed</color></b> — never a red build.
+
+  Redis documents this exact hazard: <b>"Sentinel, Docker, NAT, and possible issues"</b>. Its remedy is the
+  announce directives — replica-announce-ip/port, sentinel announce-ip/port — which decouple the address
+  a node <i>reports</i> from the one it <i>binds</i>. The module ships those builders; the extension path does not call them.
+endlegend
+
+@enduml

@@ -1,0 +1,32 @@
+@startuml redis-07-two-fault-layers
+!include _style.iuml
+title Two orthogonal fault layers on the same cluster
+
+rectangle "@RedisSentinel(enableNetworkChaos = true, enableConnectionChaos = true)" as ANN #0f141a
+
+rectangle "Redis container (any cluster node)" as C {
+  rectangle "redis-server process" as P #1c2a1c
+  rectangle "libc  ·  connect/send/recv/poll/bind/accept" as LIBC
+  rectangle "kernel  ·  net stack, qdisc, netfilter" as KERN
+  P -[#7d8590]-> LIBC
+  LIBC -[#7d8590]-> KERN
+}
+
+rectangle "**enableConnectionChaos**\nlibchaos-net via LD_PRELOAD" as CC #21100f
+rectangle "**enableNetworkChaos**\nNET_ADMIN + tc/netem + iptables" as NC #10210f
+rectangle "Toxiproxy sidecar\n<i>lazy fallback</i>" as TP #0f141a
+
+CC -[#f7768e]-> LIBC : errno per **syscall**\nECONNRESET · ECONNREFUSED\nEAGAIN · recv corruption · fd exhaustion
+NC -[#9ece6a]-> KERN : shape the **packet path**\nlatency · jitter · loss · partition
+CC .[#7d8590].> TP : only for verbs it cannot model\n(bandwidth shaping)
+
+ANN -[#58a6ff]-> CC : prepared **before** container.start()\n<i>ld.so honours LD_PRELOAD only at execve</i>
+ANN -[#58a6ff]-> NC : capability added at create time\n<i>container-scoped namespace, never --privileged</i>
+
+note bottom of C #12305a
+  Orthogonal by construction: netem reshapes packets on the wire,
+  libchaos-net fails the syscall the process made. A retry loop that
+  survives 5 % packet loss can still die on one ECONNRESET from send().
+  That difference is the reason both exist.
+end note
+@enduml

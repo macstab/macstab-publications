@@ -1,0 +1,43 @@
+@startuml redis-06-failover-clock
+!include _style.iuml
+title triggerFailover() — what the returned Duration actually measures
+
+participant "your @Test" as T
+participant "FailoverHelper" as F
+participant "master" as M
+participant "sentinel quorum\n(3, quorum 2)" as S
+participant "replica1" as R
+
+T -> F ++: cluster.getControl().triggerFailover(Duration.ofSeconds(30))
+F -> F: findMaster()\n<i>INFO replication over the internal IP —</i>\n<i>the node that reports role:master **now**</i>
+
+F -> M !!: **docker kill → SIGKILL**
+note right of M #3a1c1c
+  SIGKILL, not SIGTERM. POSIX: SIGKILL
+  cannot be caught. No FIN, no ECONNREFUSED —
+  just a peer that stops answering, which is
+  the case down-after-milliseconds exists for.
+  docker stop would test the *wrong* path.
+end note
+
+... **down-after-milliseconds = 2000 ms** ...
+S -> S: +sdown  <i>(each Sentinel, subjectively)</i>
+S -> S: +odown  <i>(quorum 2 agree)</i>
+S -> S: leader elected — **majority of all Sentinels**\n<i>+ unique configuration epoch</i>
+S -> R: REPLICAOF NO ONE  → **promotion**
+S -> S: +switch-master mymaster …
+
+loop every 500 ms, until timeout
+  F -> F: roleResolver.clearCache()
+  F -> R: INFO replication
+  R --> F: **role:master**
+end
+
+F --> T --: **Duration** kill → first observation of a new master
+
+note over T #12305a
+  assertThat(elapsed).isLessThan(Duration.ofSeconds(15));
+  …and then assert what the clock does **not** tell you:
+  replication is async, so measure the writes you lost.
+end note
+@enduml

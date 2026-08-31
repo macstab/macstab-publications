@@ -1,0 +1,91 @@
+' Shared dark style — Macstab Chaos Stack house palette
+skinparam dpi 160
+skinparam backgroundColor #0d1117
+skinparam shadowing false
+skinparam defaultFontName JetBrains Mono
+skinparam defaultFontColor #e6edf3
+skinparam defaultFontSize 13
+skinparam roundCorner 8
+
+skinparam ArrowColor #58a6ff
+skinparam ArrowFontColor #9da7b3
+skinparam ArrowFontSize 12
+
+skinparam rectangle {
+  BackgroundColor #161b22
+  BorderColor #30363d
+  FontColor #e6edf3
+}
+skinparam node {
+  BackgroundColor #161b22
+  BorderColor #30363d
+  FontColor #e6edf3
+}
+skinparam component {
+  BackgroundColor #161b22
+  BorderColor #30363d
+  FontColor #e6edf3
+}
+skinparam database {
+  BackgroundColor #161b22
+  BorderColor #30363d
+  FontColor #e6edf3
+}
+skinparam note {
+  BackgroundColor #12305a
+  BorderColor #58a6ff
+  FontColor #e6edf3
+}
+skinparam sequence {
+  ArrowColor #58a6ff
+  LifeLineBorderColor #30363d
+  LifeLineBackgroundColor #161b22
+  ParticipantBackgroundColor #161b22
+  ParticipantBorderColor #30363d
+  ParticipantFontColor #e6edf3
+  ActorBackgroundColor #161b22
+  ActorBorderColor #30363d
+  ActorFontColor #e6edf3
+  BoxBackgroundColor #0f141a
+  BoxBorderColor #30363d
+  BoxFontColor #9da7b3
+  DividerBackgroundColor #0f141a
+  DividerBorderColor #30363d
+  DividerFontColor #9ece6a
+  GroupBackgroundColor #0f141a
+  GroupBorderColor #30363d
+  GroupFontColor #e6edf3
+  GroupHeaderFontColor #9ece6a
+}
+skinparam partition {
+  BackgroundColor #0f141a
+  BorderColor #30363d
+  FontColor #9ece6a
+}
+skinparam activity {
+  BackgroundColor #161b22
+  BorderColor #30363d
+  FontColor #e6edf3
+  DiamondBackgroundColor #161b22
+  DiamondBorderColor #30363d
+  DiamondFontColor #e6edf3
+  StartColor #9ece6a
+  EndColor #f7768e
+  BarColor #58a6ff
+}
+skinparam state {
+  BackgroundColor #161b22
+  BorderColor #30363d
+  FontColor #e6edf3
+  StartColor #9ece6a
+  EndColor #f7768e
+}
+skinparam title {
+  FontColor #e6edf3
+  FontSize 17
+}
+skinparam legend {
+  BackgroundColor #0f141a
+  BorderColor #30363d
+  FontColor #9da7b3
+}

@@ -1,0 +1,39 @@
+@startuml redis-04-hello-discovery
+!include _style.iuml
+title Why each Sentinel is told only about the master
+
+participant "sentinel1" as S1
+participant "sentinel2" as S2
+participant "sentinel3" as S3
+participant "**master**\n(the rendezvous)" as M
+participant "replica1" as R1
+
+note over S1, S3 #3a2c12
+  Configured knowledge of each Sentinel at boot:
+  **the master's ip:port and a quorum. Nothing else.**
+  No Sentinel is told that the other two exist.
+  No Sentinel is told that the replicas exist.
+end note
+
+S1 -> M: SUBSCRIBE __sentinel__:hello
+S2 -> M: SUBSCRIBE __sentinel__:hello
+S3 -> M: SUBSCRIBE __sentinel__:hello
+
+loop every 2 seconds
+  S1 -> M: PUBLISH __sentinel__:hello\n<i>ip, port, runid, epoch, my view of the master</i>
+  M --> S2: (fan-out)
+  M --> S3: (fan-out)
+end
+
+S2 -> M: INFO replication
+M --> S2: role:master, slave0:…, slave1:…
+S2 -> R1: <i>replicas discovered — never configured</i>
+
+note over S1, R1 #12305a
+  Result: a complete topology view, assembled from
+  one address. Redis docs: a new Sentinel acquires the
+  other Sentinels and the replica set **within 10 seconds**.
+  That is what the module's 2 s stabilisation sleep is
+  optimistically riding on — see FIG-03.
+end note
+@enduml

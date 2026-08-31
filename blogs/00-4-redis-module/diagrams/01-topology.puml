@@ -1,0 +1,46 @@
+@startuml redis-01-topology
+!include _style.iuml
+title @RedisSentinel(replicas = 2, sentinels = 3) — six containers, one private network
+
+rectangle "Docker bridge network  ·  created per test class  ·  destroyed with it" as NET {
+
+  rectangle "sentinel1\n:26379" as S1
+  rectangle "sentinel2\n:26379" as S2
+  rectangle "sentinel3\n:26379" as S3
+
+  rectangle "**redis-master**\n:6379  ·  accepts writes" as M #1c2a1c
+
+  rectangle "redis-replica1\n:6379  ·  read-only" as R1
+  rectangle "redis-replica2\n:6379  ·  read-only" as R2
+
+  S1 -[hidden]right- S2
+  S2 -[hidden]right- S3
+  R1 -[hidden]right- R2
+
+  S1 -[#58a6ff]down-> M
+  S2 -[#58a6ff]down-> M : monitor mymaster **by internal IP**
+  S3 -[#58a6ff]down-> M
+
+  M -[#9ece6a]down-> R1 : async replication
+  M -[#9ece6a]down-> R2
+
+  S1 -[#7d8590,dashed]right- S2 : <i>__sentinel__:hello</i>
+  S2 -[#7d8590,dashed]right- S3 : <i>discovered, not configured</i>
+}
+
+note right of NET #12305a
+  Every container also publishes its port
+  to a **random host port**, so your test
+  reaches any node directly.
+
+  Sentinel, however, gossips and returns
+  the **internal** address — which is why
+  this topology is Linux-host / dev-container
+  only. See FIG-05.
+end note
+
+legend left
+  1 master + 2 replicas + 3 sentinels = 6 containers   |   quorum = (sentinels / 2) + 1 = **2**
+  down-after-milliseconds = **2000 ms** (Redis default 30000)  ·  failover-timeout = **5000 ms** (default 180000)
+endlegend
+@enduml

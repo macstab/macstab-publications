@@ -1,0 +1,58 @@
+@startuml redis-03-startup-order
+!include _style.iuml
+title Sentinel cluster startup — the order is not negotiable
+
+participant "SentinelContainer\nFactory" as F
+participant "master" as M
+participant "replica1..N" as R
+participant "Docker API" as D
+participant "sentinel1..M" as S
+
+== 1 · master ==
+F -> M ++: redis-server --protected-mode no
+M --> F --: log: "**Ready to accept connections**"
+note right of M #12305a
+  Wait on the *log line*, not the port.
+  An open port proves nothing.
+end note
+
+== 2 · replicas ==
+F -> R ++: redis-server --replicaof redis-master 6379
+R -> M: PSYNC (full sync: RDB + backlog)
+R --> F --: log: "**MASTER <-> REPLICA sync: Finished with success**"
+note right of R #12305a
+  PING would answer during RDB load —
+  and return **-LOADING** to your test.
+  Only this line means "dataset present".
+end note
+
+== 3 · address resolution ==
+F -> D ++: inspect(master).NetworkSettings
+D --> F --: **172.x.x.x** (internal IP)
+note over F #3a2c12
+  The IP — not the alias. This address is
+  gossiped to every Sentinel and handed
+  to every client. See FIG-04 / FIG-05.
+end note
+
+== 4 · sentinels ==
+F -> S ++: printf sentinel.conf && redis-server … --sentinel
+note right of S
+  port 26379
+  sentinel monitor mymaster <ip> 6379 **2**
+  sentinel down-after-milliseconds mymaster **2000**
+  sentinel parallel-syncs mymaster 1
+  sentinel failover-timeout mymaster **5000**
+end note
+S --> F --: exec ok: redis-cli -p 26379 SENTINEL master mymaster
+
+== 5 · stabilisation ==
+F -> F: sleep 2 s
+note right of F #3a1c1c
+  Pragmatic floor, not a guarantee.
+  Redis docs: a Sentinel acquires the other
+  Sentinels and replicas "within 10 seconds".
+end note
+
+F -> F: **SentinelCluster** handed to the test
+@enduml

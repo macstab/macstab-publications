@@ -1,0 +1,37 @@
+@startuml redis-02-lifecycle
+!include _style.iuml
+title Extension lifecycle — and why teardown is *not* in afterAll
+
+|#0f141a|JUnit 5 Platform|
+start
+:discover test class;
+:walk annotation graph\n(**meta-annotation search** — the JLS\ngives no annotation inheritance here);
+:register **RedisContainerExtension**\nvia @ExtendWith on @RedisStandalone;
+
+|#0f141a|beforeAll(context)|
+:CURRENT_CONTEXT.set(context)\n<i>ThreadLocal — powers INSTANCE.get(id)</i>;
+:extractAnnotations()\n<i>@RedisStandalones container, or single</i>;
+:**ResourceBudget** validate\n<i>guard clause — throws BEFORE any Docker call</i>;
+if (enableNetworkChaos / enableConnectionChaos?) then (yes)
+  :DependencyVerifier.require…Module();
+else (no)
+endif
+:**StandaloneStartupOrchestrator.start()**\nscatter–gather + bulkhead\n(fixed pool, 60 s per instance);
+:Store.put(CloseableStoreMap)\n<i>wrapper exists because JUnit closes only</i>\n<i>directly-stored CloseableResource values</i>;
+
+|#0f141a|test methods|
+:ParameterResolver injects\nStandaloneRedis / List<StandaloneRedis>;
+:...your assertions...;
+
+|#0f141a|afterAll(context)|
+:CURRENT_CONTEXT.remove();
+note right #3a1c1c
+  **That is all afterAll does.**
+  It does *not* stop containers.
+end note
+
+|#0f141a|Store close (after afterAll)|
+:CloseableStoreMap.close()\n→ Store::close → container.stop();
+:Testcontainers **Ryuk** reaps anything left\n<i>second, independent cleanup path —</i>\n<i>survives kill -9 of the Gradle worker</i>;
+stop
+@enduml
