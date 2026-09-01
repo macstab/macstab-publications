@@ -11,33 +11,35 @@
 
 **Your Redis is up. It answers `PING`. Its replicas are in sync, every dashboard is green — and it has refused every single write for the last forty minutes.**
 
-A background snapshot failed. `stop-writes-on-bgsave-error` defaults to `yes`, so Redis now rejects every command that could modify the data set. Reads still work perfectly. And because the master still answers `PING` — which is exactly what Sentinel's health check watches — there is no SDOWN, no ODOWN, no election. **No failover. Ever.** The cluster will sit there, healthy by every measure you are monitoring, until a human reads the logs.
+One background snapshot failed, and that was enough. `stop-writes-on-bgsave-error` ships set to `yes`, so from that moment Redis turns away anything capable of modifying the data set. Reads are unaffected and continue to look perfect. The master answers `PING` — which happens to be the only thing Sentinel's health check consults — so no Sentinel marks it subjectively down, nothing escalates to ODOWN, and no election is ever called. **There is no failover here. There never will be.** The cluster simply sits in that state, healthy against every signal you are monitoring, until some human being finally opens the logs.
 
-Infrastructure chaos cannot produce that: nothing died. A mocked `RedisTemplate` cannot produce it: a mock has no disk. And the code you wrote for the *other* failure — the one where a node actually dies — has never run either. Not once, not in CI, not on your laptop, because rehearsing it honestly means one master, two replicas, three Sentinels, a correct quorum, replication actually converged, and a kill at exactly the right instant. So it doesn't get written. The cache gets mocked, an embedded single-node Redis stands in for a highly-available cluster, and the first time `+switch-master` is ever observed by your client library is at 03:14 in production, in front of an audience.
+Infrastructure chaos cannot produce that, because nothing died. A mocked `RedisTemplate` cannot produce it either, because a mock has no disk. And the code you wrote for the *other* failure — the one where a node genuinely dies — has never run at all. Not once, not in CI, not on your laptop, because rehearsing it honestly means one master, two replicas, three Sentinels, a correct quorum, replication actually converged, and a kill at exactly the right instant. So it never gets written. The cache gets mocked, an embedded single-node Redis stands in for a highly-available cluster, and the first time your client library ever observes a `+switch-master` is at 03:14 in production, in front of an audience.
 
-This article is about the layer that removes that excuse. One class-level annotation:
+The layer described below exists to take that excuse away. It costs one annotation on the class:
 
 ```java
 @RedisSentinel                       // 1 master + 2 replicas + 3 sentinels, quorum 2
 class FailoverTest { }
 ```
 
-Six containers on a private Docker network, in the correct startup order, with a Sentinel config tuned so that a failover completes inside a CI budget rather than a coffee break — and a `Duration triggerFailover()` you can put an `assertThat(...).isLessThan(...)` around. And the cheap end of the same annotation family:
+Behind that line: six containers on their own private Docker network, brought up in an order that actually works, running a Sentinel configuration tuned so a failover finishes within a CI budget instead of a coffee break — and a `Duration triggerFailover()` that hands you back a number to wrap in `assertThat(...).isLessThan(...)`. The same annotation family covers the cheap end too:
 
 ```java
 @RedisStandalone                     // one real Redis 7.4, random port, auto-torn-down
 class CacheTest { }
 ```
 
-That is the whole setup. No `@Testcontainers`, no `static GenericContainer<?> redis = ...`, no `@DynamicPropertySource`, no `@BeforeAll`, no `stop()` in an `@AfterAll` that you forgot to write.
+Nothing else is required. There is no `@Testcontainers` on the class, no `static GenericContainer<?> redis = ...` field to declare, no `@DynamicPropertySource` to wire, no `@BeforeAll` to write — and no `stop()` sitting in an `@AfterAll` that you meant to add and never did.
 
-This is the third layer of the Macstab Chaos Stack — beneath it sit [six C99 `LD_PRELOAD` libraries](https://github.com/macstab/macstab-chaos-testing-libraries) that rewrite the libc/kernel contract and a JVM bytecode agent that injects faults at the Java method level; this layer contributes the thing neither of those can, *a real production-shaped topology to inject them into*. Read it at whatever depth you need: §1 gets you a Redis container in a test in ninety seconds and shows the ninety lines of Testcontainers plumbing the annotation replaces; the rest goes all the way down — Sentinel's discovery protocol and why it fights Docker port mapping, quorum versus election majority, SDOWN/ODOWN, TILT mode, the snapshot failure from the top of this article reproduced in ten seconds, and the exact places where this module's abstraction is thinner than its Javadoc suggests.
+What you are looking at is the third layer of the Macstab Chaos Stack. Two layers sit under it: [six C99 `LD_PRELOAD` libraries](https://github.com/macstab/macstab-chaos-testing-libraries) that rewrite the libc and kernel contract beneath a running process, and a JVM bytecode agent that injects faults at the level of individual Java methods. Neither of those can supply what this layer does — *a production-shaped topology worth injecting them into*.
+
+Take it at whatever depth suits you. §1 alone puts a Redis container inside a test in ninety seconds, and shows the ninety lines of Testcontainers plumbing that one annotation absorbs. Past that it descends: how Sentinel's discovery protocol collides with Docker port mapping, why quorum and election majority are different numbers, what separates SDOWN from ODOWN, what TILT mode does to your HA layer, how to reproduce the snapshot failure above in about ten seconds — and every place where this module's abstraction turns out to be thinner than its Javadoc implies.
 
 ---
 
 ## 1. The easy part — and the ninety lines it replaces
 
-One dependency. The module is published from [`github.com/macstab/chaos-testing`](https://github.com/macstab/chaos-testing) under the `com.macstab.chaos` group:
+Start with the dependency. It lives under the `com.macstab.chaos` group, published from [`github.com/macstab/chaos-testing`](https://github.com/macstab/chaos-testing):
 
 ```groovy
 // Gradle
@@ -54,7 +56,7 @@ testImplementation 'com.macstab.chaos:macstab-chaos-redis:1.0.0'
 </dependency>
 ```
 
-One annotation, one test:
+From there, the whole API is one annotation and one method parameter:
 
 ```java
 @RedisStandalone
@@ -75,65 +77,65 @@ class CacheTest {
 }
 ```
 
-`StandaloneRedis` is a two-component [record](https://openjdk.org/jeps/395) — `host`, `port` — resolved as a test-method parameter. The container is a real `redis:7.4` image on a random host port, started once before the class and stopped after it. Nothing else is required: no `@Testcontainers` on the class, no static field, no `@ExtendWith`, no lifecycle code of your own.
+Two components make up that `StandaloneRedis` [record](https://openjdk.org/jeps/395) — a host and a port — and JUnit hands it to you as a method parameter. What sits behind it is not a stub: a genuine `redis:7.4` image, bound to a random host port, started once ahead of the class and shut down when it finishes. Everything else you might expect to write is absent. No `@Testcontainers` on the class. No static field. No `@ExtendWith`. No lifecycle code of your own anywhere.
 
 ### 1.1 What that one line replaces
 
-The claim "insanely easy" only means something against the alternative, so here is the alternative. Hand-rolled Testcontainers, standalone — the version everyone has written at least once:
+Claims about ease are meaningless in isolation. So put the alternative next to it — the hand-rolled Testcontainers version of that same standalone test, which most Java teams have written at least once:
 
 ```java
 @Testcontainers
 class CacheTest {
 
-    @Container
-    static final GenericContainer<?> REDIS =
-            new GenericContainer<>(DockerImageName.parse("redis:7.4"))
-                    .withExposedPorts(6379)
-                    .waitingFor(Wait.forLogMessage(".*Ready to accept connections.*\\n", 1));
+  @Container
+  static final GenericContainer<?> REDIS =
+      new GenericContainer<>(DockerImageName.parse("redis:7.4"))
+          .withExposedPorts(6379)
+          .waitingFor(Wait.forLogMessage(".*Ready to accept connections.*\\n", 1));
 
-    static String host() { return REDIS.getHost(); }
-    static int    port() { return REDIS.getMappedPort(6379); }
+  static String host() { return REDIS.getHost(); }
+  static int    port() { return REDIS.getMappedPort(6379); }
 
-    @DynamicPropertySource
-    static void props(DynamicPropertyRegistry r) {
-        r.add("spring.data.redis.host", CacheTest::host);
-        r.add("spring.data.redis.port", CacheTest::port);
-    }
+  @DynamicPropertySource
+  static void props(DynamicPropertyRegistry r) {
+    r.add("spring.data.redis.host", CacheTest::host);
+    r.add("spring.data.redis.port", CacheTest::port);
+  }
 
-    @Test void redisAnswers() { /* … build a client from host()/port() … */ }
+  @Test void redisAnswers() { /* … build a client from host()/port() … */ }
 }
 ```
 
-Twenty lines, repeated in every test class that needs a Redis, each copy free to drift — a different image tag here, a missing wait strategy there, a `@Container` someone made non-static so it restarts per method and triples the suite runtime. Versus:
+Count what that costs you. Twenty lines, duplicated into every test class that touches Redis, with each copy drifting independently: one picks up a different image tag, another loses its wait strategy in a refactor, a third has a `@Container` that somebody made non-static, so it now restarts per method and triples the runtime of the suite. Nobody notices until CI slows down. Against that:
 
 ```java
 @RedisStandalone
 class CacheTest {
-    @Test void redisAnswers(StandaloneRedis redis) { /* … */ }
+  @Test void redisAnswers(StandaloneRedis redis) { /* … */ }
 }
 ```
 
-Now the Sentinel cluster. This is the honest hand-rolled equivalent of `@RedisSentinel` — condensed, with **no** error handling, **no** parallel startup, **no** cleanup-on-partial-failure, **no** role detection and **no** failover helper:
+The Sentinel cluster is where the gap stops being a matter of taste. Below is what `@RedisSentinel` replaces — already condensed, and already missing everything that would make it production-grade: **no** error handling, **no** parallel startup, **no** cleanup when startup fails half-way, **no** role detection, **no** failover helper.
 
 ```java
 Network net = Network.newNetwork();
 
 GenericContainer<?> master = new GenericContainer<>("redis:7-alpine")
-        .withNetwork(net).withNetworkAliases("redis-master")
-        .withExposedPorts(6379)
-        .withCommand("redis-server", "--protected-mode", "no")
-        .waitingFor(Wait.forLogMessage(".*Ready to accept connections.*\\n", 1));
+    .withNetwork(net).withNetworkAliases("redis-master")
+    .withExposedPorts(6379)
+    .withCommand("redis-server", "--protected-mode", "no")
+    .waitingFor(Wait.forLogMessage(".*Ready to accept connections.*\\n", 1));
 master.start();
 
 List<GenericContainer<?>> replicas = new ArrayList<>();
 for (int i = 1; i <= 2; i++) {
-GenericContainer<?> r = new GenericContainer<>("redis:7-alpine")
-        .withNetwork(net).withNetworkAliases("redis-replica" + i)
-        .withExposedPorts(6379)
-        .withCommand("redis-server", "--protected-mode", "no",
-                "--replicaof", "redis-master", "6379")
-        // NOT "port is open" and NOT PING — a loading replica answers both
-        .waitingFor(Wait.forLogMessage(".*MASTER <-> REPLICA sync: Finished with success.*\\n", 1));
+  GenericContainer<?> r = new GenericContainer<>("redis:7-alpine")
+      .withNetwork(net).withNetworkAliases("redis-replica" + i)
+      .withExposedPorts(6379)
+      .withCommand("redis-server", "--protected-mode", "no",
+                   "--replicaof", "redis-master", "6379")
+      // NOT "port is open" and NOT PING — a loading replica answers both
+      .waitingFor(Wait.forLogMessage(".*MASTER <-> REPLICA sync: Finished with success.*\\n", 1));
   r.start();
   replicas.add(r);
 }
@@ -142,46 +144,46 @@ GenericContainer<?> r = new GenericContainer<>("redis:7-alpine")
 // because that address is gossiped and handed to clients — so: the internal IP,
 // not the alias, not the mapped port.
 String masterIp = master.getContainerInfo().getNetworkSettings()
-        .getNetworks().values().iterator().next().getIpAddress();
+    .getNetworks().values().iterator().next().getIpAddress();
 
 int quorum = (3 / 2) + 1;
 String conf = "printf \"port 26379\\n"
-        + "sentinel monitor mymaster " + masterIp + " 6379 " + quorum + "\\n"
-        + "sentinel down-after-milliseconds mymaster 2000\\n"   // NOT the 30000 default,
-        + "sentinel parallel-syncs mymaster 1\\n"               // or no test can assert
-        + "sentinel failover-timeout mymaster 5000\\n"          // a failover in CI time
-        + "\" > /tmp/sentinel.conf && redis-server /tmp/sentinel.conf --sentinel";
+    + "sentinel monitor mymaster " + masterIp + " 6379 " + quorum + "\\n"
+    + "sentinel down-after-milliseconds mymaster 2000\\n"   // NOT the 30000 default,
+    + "sentinel parallel-syncs mymaster 1\\n"               // or no test can assert
+    + "sentinel failover-timeout mymaster 5000\\n"          // a failover in CI time
+    + "\" > /tmp/sentinel.conf && redis-server /tmp/sentinel.conf --sentinel";
 
 List<GenericContainer<?>> sentinels = new ArrayList<>();
 for (int i = 1; i <= 3; i++) {
-GenericContainer<?> s = new GenericContainer<>("redis:7-alpine")
-        .withNetwork(net).withNetworkAliases("sentinel" + i)
-        .withExposedPorts(26379)
-        .withCommand("sh", "-c", conf)
-        .waitingFor(Wait.forSuccessfulCommand("redis-cli -p 26379 SENTINEL master mymaster"));
+  GenericContainer<?> s = new GenericContainer<>("redis:7-alpine")
+      .withNetwork(net).withNetworkAliases("sentinel" + i)
+      .withExposedPorts(26379)
+      .withCommand("sh", "-c", conf)
+      .waitingFor(Wait.forSuccessfulCommand("redis-cli -p 26379 SENTINEL master mymaster"));
   s.start();
   sentinels.add(s);
 }
 
-        Thread.sleep(2000);   // __sentinel__:hello convergence — see §6.2
+Thread.sleep(2000);   // __sentinel__:hello convergence — see §6.2
 
 // … and now write the teardown, in reverse order, in an @AfterAll that must run
 // even when startup threw half-way through. Then write role detection. Then write
 // the failover helper. Then discover, on macOS, that none of it connects (§6.5).
 ```
 
-That is roughly **ninety lines of infrastructure you now own and maintain** — every line of which encodes a piece of Redis operational knowledge (which log line means "synced", why the IP and not the alias, why 2 000 and not 30 000) that is invisible in the code and will be silently wrong the first time someone copy-pastes it. Versus:
+Ninety lines, give or take — and now they are yours to maintain. Worse, they are load-bearing in ways the code never states. Three separate pieces of Redis operational knowledge are buried in there: that one specific log line is the only proof a replica has finished syncing, that Sentinel must be handed an IP rather than an alias, that 2 000 has to replace the 30 000 default or no assertion can ever finish. Delete any one of them and the tests still compile. They just start lying. And the first engineer to copy-paste this into the next test class inherits all three without knowing they exist. Against that:
 
 ```java
 @RedisSentinel
 class FailoverTest { }
 ```
 
-Same six containers, same startup order, same tuned config — plus parallel startup, failure isolation, budget validation, automatic teardown, role detection and a failover clock. The ease is not that the annotation is short; it is that **the operational knowledge moved into the framework**, where it is written once, tested, and version-controlled, instead of being re-derived per test class from a Stack Overflow answer.
+You get the same six containers in the same order with the same tuned configuration, and on top of it parallel startup, failure isolation, budget validation, automatic teardown, role detection and a failover clock. But brevity is not the argument here. The argument is where the knowledge now lives: **inside the framework**, written once, covered by tests, and under version control — rather than re-derived from scratch in every test class, by whoever happened to be on that ticket, from whichever Stack Overflow answer surfaced first.
 
 ### 1.2 It runs
 
-Everything below was executed while writing this article, on a macOS host with Docker Desktop 28.3.2, Java 25, against `macstab-chaos-redis` at `1.0.0`:
+None of the output in this article is illustrative. Every command was run while writing it, on a macOS host with Docker Desktop 28.3.2 and Java 25, against `macstab-chaos-redis` `1.0.0`:
 
 ```sh
 ./gradlew :macstab-chaos-redis:test \
@@ -206,13 +208,13 @@ BUILD SUCCESSFUL in 16s
 
 *Captured output, not a mock-up: eleven tests, two test classes, three Redis containers.*
 
-Eleven tests, two test classes, three Redis containers, sixteen seconds wall clock including compilation and the JaCoCo report — on a laptop, through a Docker Desktop VM, on the slowest supported platform.
+Read the numbers carefully, because they are less impressive than they look and that is the point: sixteen seconds covers eleven tests, two test classes and three Redis containers, *plus* compilation and the JaCoCo report — on a laptop, through a Docker Desktop VM, which is the slowest environment this module runs in.
 
 ---
 
 ## 2. What the annotation actually is
 
-`@RedisStandalone` is not magic and it is worth knowing exactly what it is, because everything else in this module composes out of the same four lines:
+Strip `@RedisStandalone` down and there is nothing clever inside it. Thirty seconds spent on its declaration pays for the rest of the article, because every other annotation in the module is assembled from these same pieces:
 
 ```java
 @ChaosTest                                   // meta: registers ChaosTestingExtension
@@ -223,29 +225,29 @@ Eleven tests, two test classes, three Redis containers, sixteen seconds wall clo
 public @interface RedisStandalone { ... }
 ```
 
-Four decisions, each load-bearing.
+Four decisions there, and none of them is decoration.
 
-**`@ExtendWith` on the annotation, not on your class.** JUnit 5 resolves `@ExtendWith` as a [meta-annotation](https://junit.org/junit5/docs/current/user-guide/#extensions-registration-declarative): declaring `@RedisStandalone` registers `RedisContainerExtension` transitively. Worth knowing *why* that is a framework feature and not a language one — Java has no annotation inheritance in this direction. [`@Inherited`](https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html#jls-9.6.4.3) (JLS §9.6.4.3) propagates an annotation from a superclass to its subclasses and nothing else; it says nothing about annotations *on* annotations. So JUnit implements the meta-annotation search itself, walking the annotation graph of the test class with cycle detection. Spring does the same thing for `@SpringBootTest`; so does Micronaut; so does Quarkus. Every "composed annotation" you have ever used is a framework working around that one gap in the JLS.
+**`@ExtendWith` on the annotation, not on your class.** JUnit 5 resolves `@ExtendWith` as a [meta-annotation](https://junit.org/junit5/docs/current/user-guide/#extensions-registration-declarative), so declaring `@RedisStandalone` registers `RedisContainerExtension` transitively. It is worth knowing *why* that is a framework feature rather than a language one, because Java offers no annotation inheritance in this direction at all. [`@Inherited`](https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html#jls-9.6.4.3) (JLS §9.6.4.3) propagates an annotation from a superclass to its subclasses, and that is the entire extent of it; it says nothing about annotations *on* annotations. So JUnit walks the annotation graph of the test class itself, with cycle detection. Spring does the same for `@SpringBootTest`. So does Micronaut. So does Quarkus. Every composed annotation you have ever used is a framework working around that one gap in the JLS.
 
-The gain is the [Extension Object pattern](https://junit.org/junit5/docs/current/user-guide/#extensions) in its intended form: your test class declares *what it needs*, never *how it is wired*, and the extension can never be registered without the configuration that parameterises it — because the configuration **is** the registration.
+The payoff is the [Extension Object pattern](https://junit.org/junit5/docs/current/user-guide/#extensions) working as designed. Your test class states *what it needs* and stays silent about *how that is wired*. And because the annotation carries both the registration and the configuration, there is no way to end up with one without the other — a whole category of misconfiguration simply cannot be expressed.
 
-**`@ChaosTest` is the framework's single registration point.** It is an internal meta-annotation that pulls in `ChaosTestingExtension`, the stack-wide orchestrator shared by every chaos annotation in the framework (`@RedisStandalone`, `@RedisSentinel`, the L3 incident packs, the resource controls). Adding an eleventh container annotation is one line, not eleven copies of `@ExtendWith`. It also means the Redis annotations sit in the same lifecycle as syscall-level and JVM-level fault injection — the layers below can be switched on inside the same test class without a second lifecycle fighting the first.
+**`@ChaosTest` is the framework's single registration point.** This one is internal plumbing: it drags in `ChaosTestingExtension`, the orchestrator that every chaos annotation in the stack shares — `@RedisStandalone`, `@RedisSentinel`, the L3 incident packs, the resource controls. Two things follow. Adding an eleventh container annotation is a one-line change instead of an eleventh duplicated `@ExtendWith`. And, more importantly, the Redis annotations end up inside the *same* lifecycle as syscall-level and JVM-level fault injection — which is what lets you switch on the layers underneath in the same test class without two lifecycles competing over the same containers.
 
-**`@Target(ElementType.TYPE)` — class scope, deliberately.** A container is a ~200 ms Docker API call plus process start; per-method provisioning would multiply that by your test count. The container is created in `beforeAll` and shared by every method in the class. The corollary is the classic Testcontainers discipline: state leaks between test methods unless you clean it (`FLUSHALL` in `@AfterEach`, or namespaced keys per test). The module does not do this for you, and it should not — silently flushing a database the test may be asserting against is worse than an explicit line.
+**`@Target(ElementType.TYPE)` — class scope, deliberately.** Provisioning a container means a Docker API call of roughly 200 ms plus process startup. Do that per test method and you have multiplied it by your entire test count, which is how a suite quietly becomes a coffee break. So the container is built once in `beforeAll` and shared across the class. That buys speed and hands you the usual Testcontainers obligation in exchange: state now survives between methods, so you clean it yourself — `FLUSHALL` in `@AfterEach`, or namespace your keys per test. The module could do that automatically and deliberately does not, because a framework that silently wipes a database your test might be asserting against is a far nastier surprise than one line you wrote on purpose.
 
-**`@Repeatable`.** Write the annotation twice and the *compiler* synthesizes the `@RedisStandalones` **containing annotation type** around both — [JLS §9.6.3](https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html#jls-9.6.3) defines the repeatable type, [JLS §9.7.5](https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html#jls-9.7.5) defines the rewrite of multiple annotations of the same type into that container. The spec imposes constraints the module has to satisfy: the containing type's `value()` must be an array of the repeatable type, its retention must be **at least as long** as the repeatable type's (both `RUNTIME` here, or the whole thing vanishes before the extension can read it), and its `@Target` must be a subset. Get any of those wrong and it is a compile error, not a runtime surprise — which is the good case.
+**`@Repeatable`.** Write the annotation twice and the *compiler* synthesizes the `@RedisStandalones` **containing annotation type** around both: [JLS §9.6.3](https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html#jls-9.6.3) defines the repeatable type, and [JLS §9.7.5](https://docs.oracle.com/javase/specs/jls/se21/html/jls-9.html#jls-9.7.5) defines the rewrite of multiple annotations of the same type into that container. The spec imposes constraints the module has to satisfy. The containing type's `value()` must be an array of the repeatable type. Its retention must be **at least as long** as the repeatable type's — both `RUNTIME` here, or the whole declaration vanishes before the extension can read it. Its `@Target` must be a subset. Get any of those wrong and you get a compile error rather than a runtime surprise, which is the good case.
 
-The consequence for the reading code is that two representations exist for the same declaration, and reflection does not unify them. You never write `@RedisStandalones` yourself; the extension reads whichever form is present:
+That rewrite has a consequence anyone reading annotations reflectively has to handle: the same declaration now arrives in one of two shapes, and reflection will not normalise them for you. Writing `@RedisStandalones` by hand is never necessary — the extension simply checks for both:
 
 ```java
 private RedisStandalone[] extractAnnotations(final ExtensionContext context) {
-    final Class<?> testClass = context.getRequiredTestClass();
-    final RedisStandalones container = testClass.getAnnotation(RedisStandalones.class);
-    if (container != null) {
-        return container.value();          // 2..n annotations → compiler-synthesized container
-    }
-    final RedisStandalone single = testClass.getAnnotation(RedisStandalone.class);
-    return single != null ? new RedisStandalone[] {single} : new RedisStandalone[0];
+  final Class<?> testClass = context.getRequiredTestClass();
+  final RedisStandalones container = testClass.getAnnotation(RedisStandalones.class);
+  if (container != null) {
+    return container.value();          // 2..n annotations → compiler-synthesized container
+  }
+  final RedisStandalone single = testClass.getAnnotation(RedisStandalone.class);
+  return single != null ? new RedisStandalone[] {single} : new RedisStandalone[0];
 }
 ```
 
@@ -269,24 +271,24 @@ afterAll(context)
 
 *The meta-annotation search, the guard clause that runs before Docker is touched, and the two independent cleanup paths.*
 
-Note what `afterAll` does *not* do: it does not stop containers. Cleanup rides on JUnit's [`ExtensionContext.Store.CloseableResource`](https://junit.org/junit5/docs/current/api/org.junit.jupiter.api/org/junit/jupiter/api/extension/ExtensionContext.Store.CloseableResource.html) contract — the store closes every `CloseableResource` it holds when its scope ends, in reverse insertion order, *after* all `afterAll` callbacks have run. The wrapper exists for a subtle reason spelled out in the source: JUnit only calls `close()` on objects stored *directly*, so a bare `Map<String, Store>` of containers would never be closed. Hence `CloseableStoreMap`, whose sole job is to fan `close()` out across the map:
+Look at what is missing from `afterAll`: it never stops a container. Teardown happens somewhere else entirely — on JUnit's [`ExtensionContext.Store.CloseableResource`](https://junit.org/junit5/docs/current/api/org.junit.jupiter.api/org/junit/jupiter/api/extension/ExtensionContext.Store.CloseableResource.html) contract, where the store closes everything it holds as its scope ends, in reverse insertion order, and only *after* the last `afterAll` callback has finished. One wrinkle forces a wrapper class into the middle of that, and the source says so outright: JUnit invokes `close()` only on values stored *directly* in the store, so a plain `Map<String, Store>` full of containers would sit there and never be closed. `CloseableStoreMap` exists purely to spread the call across the map:
 
 ```java
 private static final class CloseableStoreMap implements ExtensionContext.Store.CloseableResource {
-    @Override public void close() {
-        log.info("Cleaning up {} standalone Redis container(s)", stores.size());
-        stores.values().forEach(Store::close);       // → container.stop()
-    }
+  @Override public void close() {
+    log.info("Cleaning up {} standalone Redis container(s)", stores.size());
+    stores.values().forEach(Store::close);       // → container.stop()
+  }
 }
 ```
 
-Below that sits Testcontainers' own [Ryuk resource reaper](https://java.testcontainers.org/features/garbage_collector/) — a sidecar that holds a socket to the JVM and reaps every labelled container when that socket closes. So containers die when the test class ends, and they also die when you `kill -9` the Gradle worker, and when your IDE terminates the run. Two independent cleanup paths, which is the correct number for something that costs money in CI minutes.
+One more safety net sits underneath: Testcontainers' [Ryuk resource reaper](https://java.testcontainers.org/features/garbage_collector/), a sidecar that keeps a socket open to your JVM and destroys every labelled container the instant that socket drops. Between the two mechanisms, containers go away when the class finishes normally — and also when you `kill -9` the Gradle worker, and when your IDE murders the run half-way through. For something billed by the CI minute, two independent paths to cleanup is exactly the right number.
 
 ---
 
 ## 3. Getting a handle: parameter injection, and the static back door
 
-The extension implements [`ParameterResolver`](https://junit.org/junit5/docs/current/user-guide/#extensions-parameter-resolution), so four parameter shapes are injectable on any `@Test`, `@BeforeAll`, `@BeforeEach` or `@AfterEach` method:
+Because the extension implements [`ParameterResolver`](https://junit.org/junit5/docs/current/user-guide/#extensions-parameter-resolution), you ask for what you want in the method signature and JUnit supplies it. Four shapes work, on `@Test`, `@BeforeAll`, `@BeforeEach` and `@AfterEach` alike:
 
 | Parameter type | Resolves to |
 |---|---|
@@ -295,20 +297,20 @@ The extension implements [`ParameterResolver`](https://junit.org/junit5/docs/cur
 | `RedisConnectionInfo` | the same thing in the extension's internal type |
 | `List<RedisConnectionInfo>` | same, all instances |
 
-For Sentinel, symmetrically: `SentinelCluster`, `List<SentinelCluster>`, `SentinelRedis`, `List<SentinelRedis>`. `SentinelCluster` is the live handle (containers, control facade, failover); `SentinelRedis` is the immutable connection-info record you can hand to a client factory.
+The Sentinel side mirrors it exactly — `SentinelCluster`, `List<SentinelCluster>`, `SentinelRedis`, `List<SentinelRedis>` — but the two types are not interchangeable. Reach for `SentinelCluster` when you need the live handle: the containers themselves, the control facade, the failover trigger. Reach for `SentinelRedis` when you need an immutable record of addresses to hand to a client factory.
 
-Declaration order is not an accident — it is preserved through a `LinkedHashMap` in the orchestrator and re-derived from the annotation array on read:
+One property of those lists is worth relying on deliberately, because it did not happen by luck. A `LinkedHashMap` holds the order inside the orchestrator, and the read path re-derives it from the annotation array rather than from the map:
 
 ```java
 for (final RedisStandalone annotation : annotations) {   // annotation order, not map order
-final RedisConnectionInfo instance = instances.get(annotation.id());
+  final RedisConnectionInfo instance = instances.get(annotation.id());
   if (instance != null) { ordered.add(instance); }
-        }
+}
 ```
 
-So `all.get(0)` is the first annotation you wrote. That is asserted by the module's own integration test, and it passed in the run above.
+Which means `all.get(0)` is always the annotation you wrote first — a guarantee the module's own integration test pins down, and one that passed in the run shown above.
 
-There is also a static accessor, for the code that is not a test method — a `@BeforeAll` helper, a Spring `@DynamicPropertySource`, a fixture builder three frames down:
+Sometimes there is no method signature to inject into: a `@BeforeAll` helper, a Spring `@DynamicPropertySource`, a fixture builder three stack frames away. For those, a static accessor:
 
 ```java
 StandaloneRedis cache   = RedisStandalone.INSTANCE.get("cache");
@@ -316,31 +318,31 @@ SentinelRedis   session = RedisSentinel.INSTANCE.get("session");
 List<Redis>     all     = Redis.getAll();   // sealed interface over both topologies
 ```
 
-`Redis` is a `sealed interface ... permits StandaloneRedis, SentinelRedis`, so a switch over topologies is exhaustive without a default branch:
+Because `Redis` is declared `sealed ... permits StandaloneRedis, SentinelRedis`, the compiler knows the complete set of topologies — so a switch across them needs no default branch to be exhaustive:
 
 ```java
 String describe(Redis redis) {
-    return switch (redis) {
-        case StandaloneRedis s -> "standalone " + s.host() + ":" + s.port();
-        case SentinelRedis   s -> "sentinel master " + s.masterName() + " via " + s.sentinels();
-    };
+  return switch (redis) {
+    case StandaloneRedis s -> "standalone " + s.host() + ":" + s.port();
+    case SentinelRedis   s -> "sentinel master " + s.masterName() + " via " + s.sentinels();
+  };
 }
 ```
 
-**How the static accessor works, and what that costs.** The two access routes are the two classic answers to the same question, and the module ships both on purpose. Parameter injection is **dependency injection** — the container is handed to you, the dependency is visible in the method signature, and nothing resolves unless the framework is active. `INSTANCE.get(id)` is a **service locator** — you reach out and ask a global for it. Service locator is the [pattern Fowler argues against](https://martinfowler.com/articles/injection.html) for production wiring, for exactly the reason that applies here: it hides the dependency and moves the failure from compile time to run time.
+**How the static accessor works, and what that costs.** Those two routes are not stylistic alternatives; they are the two canonical answers to one question, and shipping both was a decision. Parameter injection is **dependency injection** — the dependency is declared in the signature, handed to you by the framework, and unresolvable when the framework is not running. `INSTANCE.get(id)` is a **service locator** — you reach into a global and pull. Fowler [argues against the locator](https://martinfowler.com/articles/injection.html) for production wiring, and his reason is precisely the one that bites here: the dependency becomes invisible, and the failure moves from compile time to run time.
 
-It earns its place anyway, because a test fixture is not production wiring: a Spring `@DynamicPropertySource` is `static` and takes a `DynamicPropertyRegistry`, so no injection point exists for it — locator or nothing. The implementation is a `ContainerManager` whose lookup calls `RedisContainerExtension.getContainer(id)`, which reads a `ThreadLocal<ExtensionContext>` set in `beforeAll`: a **thread-confined ambient context**, the same shape as `SecurityContextHolder` or `TransactionSynchronizationManager`, and with the same failure mode. Stated plainly, because it is the kind of thing that costs an afternoon:
+So why ship it? Because a test fixture is not production wiring, and sometimes the seam does not exist. Spring's `@DynamicPropertySource` is `static` and receives a `DynamicPropertyRegistry` — there is nowhere to inject anything, so it is the locator or nothing at all. The mechanism behind it is a `ContainerManager` delegating to `RedisContainerExtension.getContainer(id)`, which reads a `ThreadLocal<ExtensionContext>` planted in `beforeAll`. That makes it a **thread-confined ambient context** — architecturally the same animal as `SecurityContextHolder` or `TransactionSynchronizationManager`, and heir to the same failure modes. Those are worth spelling out, because each one costs an afternoon the first time:
 
-- Called outside a `@RedisStandalone` class you get `IllegalStateException: Called outside @RedisStandalone test context` — clear, not a `NullPointerException`.
-- Called from a thread that is not the JUnit worker (an executor you spawned, a reactive scheduler), the `ThreadLocal` is empty and you get the same exception. Resolve the handle on the test thread and pass it in.
-- The `ThreadLocal` is cleaned twice — in `afterAll`, and again by a `ThreadLocalCleanup` `CloseableResource` — because JUnit worker threads are pooled and a leaked context is a leaked `ExtensionContext` graph.
-- `get("default")` is forgiving in exactly one direction: with a single instance it returns that instance whatever its id; with several instances and no `id="default"` it throws and *names the ids that do exist*.
+- Call it from outside a `@RedisStandalone` class and it raises `IllegalStateException: Called outside @RedisStandalone test context`. That wording is deliberate — a `NullPointerException` would have told you nothing.
+- Call it from any thread other than the JUnit worker — an executor you started, a reactive scheduler — and the `ThreadLocal` is empty, producing the same exception. The fix is to resolve the handle on the test thread and pass the value across yourself.
+- Two separate mechanisms clear that `ThreadLocal`: `afterAll`, and a `ThreadLocalCleanup` `CloseableResource` behind it. Belt and braces, because JUnit pools its worker threads, and a context left behind is an entire `ExtensionContext` graph left behind with it.
+- Only one kind of leniency is built into `get("default")`. Where a single instance exists it returns that instance whatever id you gave it. Where several exist and none is called `"default"`, it refuses — and the exception *lists the ids that are actually available*.
 
 ---
 
 ## 4. Several Redises, started in parallel, with failure isolation
 
-Repeat the annotation and you get independent instances:
+Stack the annotation and each copy becomes a fully independent instance:
 
 ```java
 @RedisStandalone(id = "cache",        version = "7.4")
@@ -348,63 +350,63 @@ Repeat the annotation and you get independent instances:
 @RedisStandalone(id = "rate-limiter")
 class MultiStoreTest {
 
-    @Test
-    void storesAreIsolated() {
-        var cache   = RedisStandalone.INSTANCE.get("cache");
-        var session = RedisStandalone.INSTANCE.get("session");
-        // same key, two Redises, two answers
-    }
+  @Test
+  void storesAreIsolated() {
+    var cache   = RedisStandalone.INSTANCE.get("cache");
+    var session = RedisStandalone.INSTANCE.get("session");
+    // same key, two Redises, two answers
+  }
 }
 ```
 
-They start concurrently. The orchestrator is small enough to quote in full intent:
+Those three do not start one after another — they start together, and the orchestrator behind that is compact enough to show in full intent:
 
 ```java
 final ExecutorService executor = Executors.newFixedThreadPool(annotations.length);
 final List<Future<StartupResult>> futures = submitStartupTasks(executor, annotations);
 // … collect with a per-instance timeout, then:
 if (!failures.isEmpty()) {
-final List<String> cleanupActions = cleanupInstances(toCleanup);   // stop the ones that DID start
+  final List<String> cleanupActions = cleanupInstances(toCleanup);   // stop the ones that DID start
   throw new ClusterStartupException(failures, cleanupActions);
 }
 ```
 
-That is **scatter–gather** with a **bulkhead**: fan the work out, collect every outcome independently, and never let one failing unit sink the others or the reporting. Four properties fall out of it, and each is a real-world CI failure mode someone has already paid for:
+Structurally that is **scatter–gather** wrapped in a **bulkhead**: work fans out, every outcome is collected on its own terms, and no single failure is allowed to take down its neighbours or the report you need to debug them. Four consequences follow, and each one corresponds to a CI failure somebody has already lost a day to.
 
-**Bounded, not unbounded, waiting.** `future.get(60, SECONDS)` per standalone instance (120 s per Sentinel cluster). A Docker daemon that has wedged on an image pull produces a named, timestamped failure — `Instance 'cache' startup timed out` — rather than a build that sits at 0 % until the CI job's global timeout kills it an hour later with no diagnosis.
+**Waiting is bounded.** Every standalone instance gets `future.get(60, SECONDS)`; every Sentinel cluster gets 120. When a Docker daemon wedges mid image-pull, the result is a named, timestamped failure that says `Instance 'cache' startup timed out`. The alternative — and this is what you get without the bound — is a job frozen at 0 % until the CI platform's global timeout kills it an hour later, leaving nothing behind to diagnose.
 
-**Failure isolation, expressed as a type.** `StartupResult` is a **sum type** — an algebraic data type in the ML sense, spelled in Java as a [sealed interface](https://openjdk.org/jeps/409) (JEP 409) permitting exactly two [records](https://openjdk.org/jeps/395) (JEP 395), consumed by [pattern matching for `switch`](https://openjdk.org/jeps/441) (JEP 441):
+**Isolation encoded in the type system.** Rather than a status flag, `StartupResult` is a **sum type** — an algebraic data type in the ML tradition, written in Java as a [sealed interface](https://openjdk.org/jeps/409) (JEP 409) that permits exactly two [records](https://openjdk.org/jeps/395) (JEP 395) and is consumed through [pattern matching for `switch`](https://openjdk.org/jeps/441) (JEP 441):
 
 ```java
 public sealed interface StartupResult permits StartupResult.Success, StartupResult.Failure {
-    String instanceId();
-    record Success(String instanceId, RedisConnectionInfo connectionInfo, Store store)
-            implements StartupResult {}
-    record Failure(String instanceId, String errorMessage, Exception error)
-            implements StartupResult {}
+  String instanceId();
+  record Success(String instanceId, RedisConnectionInfo connectionInfo, Store store)
+      implements StartupResult {}
+  record Failure(String instanceId, String errorMessage, Exception error)
+      implements StartupResult {}
 }
 ```
 
 ```java
 switch (result) {
-        case StartupResult.Success s -> { successful.put(s.instanceId(), s.connectionInfo()); … }
-        case StartupResult.Failure f -> failures.add(new ClusterStartupFailure(f.instanceId(), …));
-        }
+  case StartupResult.Success s -> { successful.put(s.instanceId(), s.connectionInfo()); … }
+  case StartupResult.Failure f -> failures.add(new ClusterStartupFailure(f.instanceId(), …));
+}
 ```
 
-Sealing is what makes that `switch` **exhaustive without a `default`** — the compiler can enumerate the permitted subtypes, so adding a third outcome (`Skipped`, say) turns every consuming switch into a compile error instead of a silently-taken default branch. That is the whole argument for ADTs over the `boolean success` + nullable-fields struct this replaced, and it is a genuine correctness property, not a style preference. One instance failing does not abort collection of the others; every failure is gathered and reported together, so you see *all three* broken configurations on the first run, not one per push.
+The `sealed` keyword is doing real work in that snippet. Because the compiler can enumerate every permitted subtype, the `switch` is **exhaustive with no `default` branch** — and the day somebody adds a third outcome, say `Skipped`, every consumer stops compiling instead of quietly falling through to a default that does the wrong thing. That is the case for algebraic data types over the `boolean success` plus nullable-fields struct this replaced, and it is a correctness guarantee rather than a matter of taste. The runtime behaviour matches: one failing instance never aborts collection of the rest, and all failures are reported together — so three broken configurations surface on one run, not across three pushes.
 
-**Cleanup on partial failure.** If instance 3 of 5 fails, instances 1 and 2 are already running and would otherwise leak until Ryuk noticed. They are stopped explicitly, and *what was stopped* is attached to the thrown `ClusterStartupException` alongside the failures.
+**Partial failure still cleans up.** Picture instance 3 of 5 failing: by then 1 and 2 are up and would linger until Ryuk got around to them. Instead they are stopped there and then, and the list of *what was stopped* travels inside the thrown `ClusterStartupException` next to the failures that caused it.
 
-**Ordering survives concurrency.** Results are collected by iterating the futures in annotation order, so parallel startup never reorders `List<StandaloneRedis>`.
+**Concurrency does not scramble the order.** Collection walks the futures in annotation order, so however the containers race each other to start, `List<StandaloneRedis>` comes back in the sequence you declared.
 
-The measured effect on the two-instance class in the run above: both containers came up concurrently, and the whole class — five tests, two Redis instances, including data-isolation assertions across both — contributed to a sixteen-second total build.
+In the run captured earlier this is measurable rather than theoretical: the two-instance class brought both containers up together, and everything it does — five tests, two Redis instances, data-isolation assertions crossing between them — fitted inside the same sixteen-second build.
 
 ---
 
 ## 5. The budget that stops you before Docker does
 
-Before a single Docker API call, `ResourceBudget` validates the request:
+`ResourceBudget` runs first, before anything reaches the Docker API at all:
 
 ```java
 public static final int MAX_SENTINEL_CLUSTERS    = 3;
@@ -414,7 +416,7 @@ public static final int MAX_MEMORY_MB            = 100;
 private static final int MEMORY_PER_CONTAINER_MB = 4;   // redis:7-alpine baseline
 ```
 
-A sixth `@RedisStandalone` on one class, or a fourth `@RedisSentinel`, fails in `beforeAll` with a message that says what the limit is and what to do about it:
+Ask for a sixth `@RedisStandalone` on one class, or a fourth `@RedisSentinel`, and `beforeAll` refuses — with a message that names the limit and tells you the way out:
 
 ```
 ResourceBudgetExceededException: Too many Sentinel clusters: 4 (max: 3).
@@ -422,15 +424,15 @@ ResourceBudgetExceededException: Too many Sentinel clusters: 4 (max: 3).
   Consider reducing cluster count or using standalone Redis for non-HA tests.
 ```
 
-Mixed topologies are counted the way you'd hope — `1 + replicas + sentinels` per cluster, plus one per standalone — so `@RedisSentinel(replicas=2, sentinels=3)` alongside two `@RedisStandalone` is 8 of 20.
+Mixing topologies counts exactly as you would expect: `1 + replicas + sentinels` for every cluster, one for every standalone. So `@RedisSentinel(replicas=2, sentinels=3)` sitting beside two `@RedisStandalone` declarations occupies 8 of the 20 slots.
 
-Two honest notes. The memory figure is a *nominal* accounting constant (4 MB × containers, ceiling 100 MB), not a measurement of the host and not a cgroup limit imposed on the containers; an empty `redis:7-alpine` process plus container overhead lands nearer 15–30 MB in practice. Treat the budget as what it is — a guard rail against the misconfiguration where a loop or a copy-paste asks for forty containers — not as a capacity planner. And the budget is *per test class*: ten classes at five instances each, running under Gradle `--parallel`, is fifty containers, and nothing in this module knows that. Your Docker daemon's `pids`, memory and network-per-bridge limits are still yours to respect.
+Two things about this deserve honesty rather than salesmanship. The memory number is *nominal* — an accounting constant of 4 MB per container against a 100 MB ceiling. It measures nothing about your host, and it imposes no cgroup limit on anything. Reality for an empty `redis:7-alpine` process plus container overhead is closer to 15–30 MB. So use the budget for what it actually is, a guard rail against the loop or the copy-paste that asks for forty containers, and never as a capacity planner. The second point is scope. All of this is enforced *per test class*, which means ten classes running five instances each under Gradle `--parallel` is fifty live containers, and nothing in this module has any idea. Your daemon's `pids` ceiling, its memory, and its per-bridge network limits are still entirely your problem.
 
 ---
 
 ## 6. `@RedisSentinel`: what is actually hard here
 
-Everything up to this point is convenience. This is the part that is genuinely difficult, and the reason the module exists.
+Everything so far has been convenience — pleasant, but not why anyone would build this. The hard part starts here, and it is the reason the module exists.
 
 ```java
 @RedisSentinel(replicas = 2, sentinels = 3)
@@ -439,11 +441,11 @@ class FailoverTest { }
 
 ![FIG-01 · the topology one annotation provisions](./images/redis-01-topology.png)
 
-*One master, two replicas, three Sentinels, one private bridge network — created for the test class and destroyed with it. Each Sentinel is configured with the master's **internal** address and a quorum; it discovers the other Sentinels and every replica by itself.*
+*A master, two replicas and three Sentinels sharing one private bridge network that is born with the test class and dies with it. Every Sentinel receives just two things — the master's **internal** address and a quorum — and works out the rest of the topology, its peers and all the replicas, unaided.*
 
 ### 6.1 The startup order is not negotiable
 
-[Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/) monitors a master by address. Start the Sentinels first and they monitor nothing; start them before replication has converged and the first thing they may see is a master with zero healthy replicas — a cluster that cannot fail over. The factory therefore serialises four phases, each with a *semantic* wait strategy rather than a sleep:
+[Sentinel](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/) tracks a master by address, and that single fact dictates the entire startup sequence. Bring the Sentinels up first and they have nothing to monitor. Bring them up before replication has converged and their first observation is a master with no healthy replicas behind it — in other words, a cluster incapable of failing over. Four phases therefore run in strict order, and every one waits on a *semantic* signal instead of a sleep:
 
 | Phase | Command | Ready when |
 |---|---|---|
@@ -456,13 +458,13 @@ class FailoverTest { }
 
 *Four phases, each gated on a semantic signal rather than a sleep — and the one honest `Thread.sleep` at the end.*
 
-The replica wait strategy is the good one. `MASTER <-> REPLICA sync: Finished with success` is the log line Redis emits at the end of the [full synchronisation](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/) handshake — `PSYNC`, RDB snapshot transfer, backlog catch-up. Waiting on the *port* being open would return true while the replica is still loading the RDB and answering `-LOADING Redis is loading the dataset in memory`. Waiting on `PING` would return true for the same reason. Only that line means "this replica now holds the master's dataset and is streaming the backlog".
+If you take one thing from this section, take the replica wait strategy. `MASTER <-> REPLICA sync: Finished with success` is emitted only when the [full synchronisation](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/) handshake has completed end to end — `PSYNC`, RDB snapshot transfer, backlog catch-up. Now consider the obvious alternatives. Waiting for the port to open succeeds while the replica is still loading the RDB into memory. Waiting for `PING` succeeds for the same reason, because a loading replica answers it — and then answers your test's first real command with `-LOADING Redis is loading the dataset in memory`. That log line is the only signal that actually means the data has arrived and the backlog is streaming.
 
-The Sentinel wait strategy is `Wait.forSuccessfulCommand(...)` around `SENTINEL master mymaster` — the Sentinel process is up *and* has parsed its config *and* has resolved that master. Then a flat 2 000 ms sleep, honestly labelled in the source: after the `+monitor` event, Sentinels still need a moment to discover each other. Which brings us to the mechanism that makes that sleep necessary.
+Sentinels get `Wait.forSuccessfulCommand(...)` wrapped around `SENTINEL master mymaster`, which happens to prove three separate things in one call: the process started, it parsed its configuration, and it resolved the master it was told to watch. After that comes a flat 2 000 ms sleep, labelled as exactly that in the source, because `+monitor` firing does not mean the Sentinels have found one another yet. Understanding why they need that moment means understanding how they find each other at all.
 
 ### 6.2 Why each Sentinel is told only about the master
 
-Look at the config the module writes — it is the entire Sentinel configuration, built by `RedisCommandBuilder.buildSentinelStartCommand()` and `printf`'d into the container at launch:
+Here is every line of configuration each Sentinel receives, assembled by `RedisCommandBuilder.buildSentinelStartCommand()` and `printf`'d into the container as it launches:
 
 ```
 port 26379
@@ -472,28 +474,28 @@ sentinel parallel-syncs mymaster 1
 sentinel failover-timeout mymaster 5000
 ```
 
-Three Sentinels, and not one of them is told about the other two. It doesn't need to be — because the topology is discovered, not configured, by a **publish–subscribe rendezvous** over the very resource being monitored. Sentinel's discovery is [pub/sub-based](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#adding-or-removing-sentinels): every Sentinel publishes a hello message to the `__sentinel__:hello` channel *on the monitored master and its replicas* every two seconds, carrying its own address, run-id, epoch and its view of the master. Every Sentinel subscribes to that channel. So the master itself is the rendezvous point: three Sentinels that each know only the master converge on a complete view of each other within a couple of publish intervals. Replicas are discovered the same way — from the master's `INFO replication` output, which is why the module never has to tell Sentinel about the replicas either.
+Count what is in that file, then count what is missing. Three Sentinels are about to run, and none of them is told that the other two exist. Nor are the replicas mentioned anywhere. That is not an oversight — the topology is *discovered*, through a **publish–subscribe rendezvous** held on the very thing being monitored. The mechanism is [documented](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#adding-or-removing-sentinels) and elegant: every two seconds each Sentinel publishes a hello message to the `__sentinel__:hello` channel *on the master and on every replica*, announcing its address, run-id, epoch and current view of the master — and every Sentinel is subscribed to that same channel. The master, in other words, is the meeting point. Three processes that each know one address converge on a complete picture of each other within a couple of publish intervals. The replicas fall out of the master's `INFO replication` output, which is why nobody ever has to configure those either.
 
 ![FIG-04 · hello-channel discovery](./images/redis-04-hello-discovery.png)
 
 *Each Sentinel boots knowing one address. The master is the rendezvous: everything else — the other Sentinels, every replica — is discovered over `__sentinel__:hello` and `INFO replication`.*
 
-That is the whole reason for the 2-second stabilisation wait — and the honest caveat about it. Redis's documentation says a newly started Sentinel acquires the list of other Sentinels and the replica set "within 10 seconds", so two seconds is a pragmatic floor stacked on top of the per-Sentinel `SENTINEL master mymaster` readiness probe, not a guarantee that mutual discovery has completed. Every Sentinel is verifiably monitoring the master when the cluster is handed to your test; whether all three have seen each other yet is a race you should not write assertions against in the first millisecond. Assert on the cluster's *behaviour* (a failover completes) rather than on `num-other-sentinels` at t=0.
+Now the 2-second wait makes sense — and so does its limitation, which is worth stating rather than hiding. Redis's own documentation puts full discovery at "within 10 seconds" for a newly started Sentinel. Two seconds is therefore a pragmatic floor sitting on top of the per-Sentinel readiness probe, not proof that the gossip has settled. What the module can promise when it hands you the cluster is narrow and true: every Sentinel is verifiably monitoring the master. Whether all three have seen each other yet is a race. So write assertions against the cluster's *behaviour* — that a failover actually completes — and not against `num-other-sentinels` at t=0.
 
-It is also the reason the module passes the master's **internal Docker IP** rather than the network alias `redis-master`: the address in `sentinel monitor` is not just a connection target, it is the identity that gets gossiped to every other Sentinel and handed to every client that asks. An alias that only resolves inside one container's DNS view would propagate as an address other participants cannot use.
+The same mechanism explains a choice that otherwise looks arbitrary: the module hands Sentinel the master's **internal Docker IP** instead of the alias `redis-master`. That address is not merely something to connect to. It is the identity that gets gossiped onward to every other Sentinel and returned to every client that asks. An alias resolvable only inside one container's DNS view would propagate as an address nobody else can reach.
 
 ```java
 static String getMasterIpAddress(final GenericContainer<?> master) {
-    return master.getContainerInfo().getNetworkSettings().getNetworks().values().stream()
-            .findFirst()
-            .orElseThrow(() -> new RuntimeException("Master container has no network"))
-            .getIpAddress();
+  return master.getContainerInfo().getNetworkSettings().getNetworks().values().stream()
+      .findFirst()
+      .orElseThrow(() -> new RuntimeException("Master container has no network"))
+      .getIpAddress();
 }
 ```
 
 ### 6.3 The timing constants are the interesting part
 
-Compare what the module writes with Redis's own defaults:
+Set the values the module writes beside the ones Redis ships with:
 
 | Directive | Redis default | This module | Why |
 |---|---|---|---|
@@ -502,52 +504,52 @@ Compare what the module writes with Redis's own defaults:
 | `parallel-syncs` | 1 | 1 | replicas allowed to resync with the new master *simultaneously* — 1 means one at a time, so the rest keep serving (stale) reads instead of all blocking on a full sync at once |
 | `quorum` | — | `(sentinels / 2) + 1` | 3 → 2, 5 → 3 |
 
-Those "Redis default" numbers are not from memory — here they are, read out of a real Redis 7.4.8 Sentinel that was given nothing but a `sentinel monitor` line:
+That "Redis default" column is not quoted from memory. It was read back out of a live Redis 7.4.8 Sentinel that had been handed a single `sentinel monitor` line and nothing else:
 
 ![FIG-T3 · Sentinel's actual defaults](./images/term-03.png)
 
 *`SENTINEL master mymaster` on an otherwise-unconfigured Sentinel. 30 000 ms to detection, 180 000 ms failover timeout.*
 
-Thirty seconds of `down-after-milliseconds` is correct in production: it is the guard against a GC pause, a slow disk, or a two-second network blip triggering a real failover with real write loss. In a test it means a failover assertion cannot complete inside any sane CI budget, so nobody writes one. Two seconds is the number that makes the assertion possible — and this is exactly the kind of decision that has to be made *once, in the framework*, by someone who knows why the production default is what it is. A test that waits 35 seconds to observe a promotion gets deleted by the third engineer who runs the suite.
+Do not read the 30 000 default as a mistake Redis made. It is the right number in production, where it stands between you and a real failover — with real write loss — every time a GC pause, a slow disk or a two-second network blip makes a healthy master look briefly unreachable. The trouble is that the same number makes the assertion unwritable: no failover test can finish inside a sane CI budget, so the test never gets written and the code path stays unexercised. Dropping to 2 000 is what puts it back within reach, and it is exactly the sort of judgement that belongs *once, in a framework*, made by somebody who understands why the production default is set where it is. A test that takes 35 seconds to watch one promotion will be deleted by the third engineer who runs the suite, and they will be right to.
 
-The trade is that a 2-second detection window is *tight*. A Docker Desktop VM under load, a laptop that swapped, a CI runner with noisy neighbours — any of those can stall a Redis process past two seconds and produce a spurious `+sdown`. In a failover test that is harmless (the cluster does what it is supposed to do). In a test that asserts *no* failover happened, it is a flake, and you should raise the window for that class rather than pretend it cannot happen.
+That number is not free, though: two seconds is a *tight* detection window. A Docker Desktop VM under load, a laptop that just swapped, a CI runner with noisy neighbours — each can stall a Redis process past the threshold and produce a `+sdown` nobody asked for. When the test's whole point is a failover, that costs nothing; the cluster behaves correctly either way. When the test asserts that *no* failover occurred, it is a flake waiting for a busy afternoon. Widen the window for that class instead of hoping.
 
 ### 6.4 Quorum is not the election majority — and mixing them up loses data
 
-This is the single most misunderstood parameter in Redis HA, so it is worth being exact.
+No parameter in Redis HA is misread as often as this one, and the cost of misreading it is measured in lost writes — so precision matters more than brevity here.
 
-`quorum` is the number of Sentinels that must independently mark the master as subjectively down (**SDOWN**, one Sentinel's own opinion after `down-after-milliseconds` of no valid reply) before it is promoted to objectively down (**ODOWN**, an agreed verdict, which exists only for masters, never for replicas). ODOWN is what *authorises* a failover attempt.
+Start with what `quorum` counts. It is the number of Sentinels that must *independently* conclude the master is unreachable — each one reaching **SDOWN**, its own private verdict after `down-after-milliseconds` passes without a valid reply — before that verdict is promoted to **ODOWN**, the agreed one. ODOWN applies to masters and to nothing else; replicas never get one. And ODOWN is what *authorises* a failover attempt.
 
-It is **not** what performs one. The [Sentinel documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#quorum) is unambiguous, and worth quoting exactly:
+What it does **not** do is carry out that failover. On this point the [Sentinel documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#quorum) leaves no room for interpretation, so it is worth quoting rather than paraphrasing:
 
 > However **the quorum is only used to detect the failure**. In order to actually perform a failover, one of the Sentinels need to be elected leader for the failover and be authorized to proceed. This only happens with the vote of the **majority of the Sentinel processes**.
 
-So a failover needs *both*: quorum Sentinels agreeing the master is down (ODOWN), **and** a majority of all known Sentinels voting one of them leader — or more than the majority, if you set quorum higher than the majority. The elected leader receives a unique **configuration epoch** for that failover, which versions the resulting configuration so that two Sentinels can never propagate conflicting views of who the master is. If you have read Raft, the shape will be familiar — epoch as term, one leader per epoch, votes granted at most once — though Redis's own documentation describes the mechanism in its own terms rather than claiming the algorithm. From the [Sentinel documentation](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#quorum): the quorum only decides ODOWN; the majority is always required to elect a leader and start the failover.
+Two independent conditions must hold, then, before anything is promoted: quorum Sentinels agreeing the master is down, *and* a majority of all known Sentinels electing one of them to run the failover — or more than a majority, should you configure quorum above it. Whoever wins that election receives a unique **configuration epoch**, which versions the configuration it produces and makes it impossible for two Sentinels to circulate conflicting claims about who the master is. Readers who know Raft will recognise the machinery — epoch behaving as term, one leader per epoch, each vote spent once. Redis documents this in its own vocabulary rather than naming the algorithm, and so does this article.
 
-The practical consequence: setting `quorum = 1` on five Sentinels does *not* give you a cluster that fails over when one Sentinel is lonely. It gives you fast ODOWN — and then, if only two Sentinels can see each other, no leader, no failover, and a cluster that has decided the master is dead but can do nothing about it. And in the opposite direction — a partition that isolates the master with a minority of Sentinels — the majority requirement is precisely what stops the minority side from promoting a second master and giving you two divergent datasets.
+Follow that through and the popular misconfiguration falls apart. Setting `quorum = 1` across five Sentinels does *not* produce a cluster that fails over whenever a single Sentinel feels lonely. It produces fast ODOWN and nothing else: if only two of the five can still see each other, no leader can be elected, no failover runs, and you are left with a cluster that has correctly concluded its master is dead and is powerless to act. The inverse case is where that majority rule earns its keep. When a partition strands the master with a minority of Sentinels, the majority requirement is the only thing preventing that minority from promoting a second master and leaving you with two datasets that disagree.
 
-The module derives `quorum = (sentinels / 2) + 1` — 3 → 2, 5 → 3 — which makes ODOWN and the election majority coincide. That is the configuration you want unless you are deliberately testing a split.
+Hence the module's formula, `quorum = (sentinels / 2) + 1` — 3 becomes 2, 5 becomes 3 — which lines ODOWN up exactly with the election majority. Unless you are deliberately engineering a split-brain scenario, that is the configuration you want.
 
-**Sharp edge, stated plainly:** the `quorum()` attribute on `@RedisSentinel` is currently *not plumbed through* to the container configuration — the factory always computes the majority formula from `sentinels`. For the default (3 sentinels, quorum 2) the two agree, so nothing is observable; if you set `quorum = 1` expecting a fast-ODOWN cluster, you will not get one. Two neighbouring attributes have the same gap today: `version()` on `@RedisSentinel` is not applied to the cluster nodes (they are always `redis:7-alpine`; `version()` on `@RedisStandalone` *is* honoured), and `masterName()` is stored in the `SentinelCluster`/`SentinelRedis` records but the generated Sentinel config always monitors the name **`mymaster`**. So this compiles, runs, and then fails to connect:
+**One sharp edge, stated before you hit it.** As the module stands today, `quorum()` on `@RedisSentinel` never reaches the container configuration at all — the factory computes the majority formula from `sentinels` and uses that instead. With the defaults, 3 sentinels and quorum 2, both routes produce the same number and nothing is observable. Ask for `quorum = 1` expecting fast ODOWN, however, and you will not get it. Two neighbouring attributes have the same gap. `version()` on `@RedisSentinel` never reaches the nodes, which are pinned to `redis:7-alpine` regardless — note that `version()` on `@RedisStandalone` *is* honoured, which makes the inconsistency easy to trip over. And `masterName()` is faithfully stored in the `SentinelCluster` and `SentinelRedis` records while the generated config monitors **`mymaster`** no matter what you passed. The result compiles, runs, and then fails to connect:
 
 ```java
 @RedisSentinel(masterName = "ha-master")            // ← record says "ha-master" …
 class Wrong {
-    @Test void t(SentinelRedis c) {
-        var pool = new JedisSentinelPool(c.masterName(), sentinelAddrs(c));   // … Sentinel knows "mymaster"
-    }
+  @Test void t(SentinelRedis c) {
+    var pool = new JedisSentinelPool(c.masterName(), sentinelAddrs(c));   // … Sentinel knows "mymaster"
+  }
 }
 ```
 
-Use `"mymaster"` — or read the name from the cluster and pin it in one place — until that attribute is wired. It is a five-line fix in `RedisCommandBuilder`, and it is exactly the sort of thing that a Javadoc-only reading of the module will not tell you.
+So until that attribute is wired through, pass `"mymaster"` — or read the name off the cluster and keep it in exactly one place in your test. The fix itself is about five lines in `RedisCommandBuilder`. Its interest lies in the category: this is the class of defect no amount of Javadoc-reading will ever reveal to you.
 
 ### 6.5 The address problem: why this is Linux-only, and why that is not laziness
 
-Here is the deep reason Sentinel plus Testcontainers is hard, and why almost nobody ships it.
+Everything above works. This is the part that decides whether it works *on your machine* — and it is why Sentinel under Testcontainers is something almost nobody ships.
 
-Sentinel is a **discovery protocol**, not a proxy. A Sentinel-aware client does not connect to Sentinel and get its traffic forwarded; it asks a Sentinel `SENTINEL get-master-addr-by-name mymaster`, receives an address, and then opens a *direct* connection to that address. It also subscribes to `+switch-master` events to learn the new address after a failover.
+The root of it is a single architectural fact: Sentinel is a **discovery protocol**, not a proxy. Traffic never flows through it. A Sentinel-aware client asks `SENTINEL get-master-addr-by-name mymaster`, takes the address it gets back, and opens its own *direct* connection to that address — subscribing to `+switch-master` on the way, so that a later failover updates it.
 
-Inside the test's Docker network, the master's address is `172.18.0.2:6379`. That is what Sentinel knows, gossips, and returns. Your JVM is on the host, and reaches Redis through a *mapped* port — `localhost:54321`. So the sequence is:
+Which is fine, until two address spaces disagree. Inside the test's Docker network the master lives at `172.18.0.2:6379`; that is what Sentinel stores, gossips onward, and returns to callers. Your JVM is not inside that network. It sits on the host and speaks to Redis through a *mapped* port — `localhost:54321`, say. Trace one lookup through both worlds:
 
 ```
 JVM  ──▶ sentinel (localhost:54873)   "where is mymaster?"
@@ -555,7 +557,7 @@ JVM  ◀──                              "172.18.0.2:6379"
 JVM  ──▶ 172.18.0.2:6379              ← routable from a Linux host. Not from a Docker Desktop VM.
 ```
 
-On a **Linux host** with a native Docker daemon, the container bridge network is a real interface on the host, so `172.18.0.2:6379` is genuinely reachable and everything works. Inside a **dev container or CI container** sharing the daemon's network, likewise. On **macOS or Windows**, Docker Desktop runs the daemon inside a lightweight Linux VM; the bridge subnet lives in the VM, the host has no route to it, and every Sentinel-aware client fails at the second hop — after a successful Sentinel handshake, which makes the failure maximally confusing.
+Whether that third step succeeds depends entirely on where your daemon runs. Give it a **native Linux host** and the container bridge is a genuine interface on that machine, so `172.18.0.2:6379` routes and everything behaves. Run inside a **dev container or CI container** sharing the daemon's network and you get the same result. Move to **macOS or Windows**, though, and Docker Desktop puts the daemon inside a lightweight Linux VM — the bridge subnet lives in there, your host holds no route to it, and every Sentinel-aware client dies on that second hop. The cruelty is in the ordering: the handshake with Sentinel succeeds first, so the failure arrives *after* the part that looked difficult.
 
 ![FIG-05 · why the second hop dies on macOS](./images/redis-05-address-problem.png)
 
@@ -563,17 +565,17 @@ On a **Linux host** with a native Docker daemon, the container bridge network is
 
 None of this is a Testcontainers quirk — Redis documents it directly, under the heading [*Sentinel, Docker, NAT, and possible issues*](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#sentinel-docker-nat-and-possible-issues): "Docker uses a technique called port mapping: programs running inside Docker containers may be exposed with a different port compared to the one the program believes to be using… Remapping ports and addresses creates issues with Sentinel."
 
-Redis's own answer to this is the announce directives — `replica-announce-ip` / `replica-announce-port` on data nodes and `sentinel announce-ip` / `announce-port` on Sentinels — which decouple *the address a node reports* from *the address it binds*. The module ships builders for exactly that (`SentinelCommandBuilder.configureMasterAnnouncement`, `configureReplicaAnnouncement`, `configureSentinelAnnouncement`) plus the `host.testcontainers.internal:host-gateway` extra host on every node for Docker-in-Docker reachability. Honest status: **those builders are not invoked on the current extension path.** The supported configuration is a Linux host or a container, and the module enforces that rather than letting you discover it through a nine-minute connection timeout:
+Redis solves this with the announce directives: `replica-announce-ip` and `replica-announce-port` on data nodes, `sentinel announce-ip` and `announce-port` on the Sentinels themselves. All four exist to break the assumption that the address a node *reports* is the address it *binds*. The module already contains builders for them — `SentinelCommandBuilder.configureMasterAnnouncement`, `configureReplicaAnnouncement`, `configureSentinelAnnouncement` — and every node carries the `host.testcontainers.internal:host-gateway` extra host for Docker-in-Docker reachability. What it does not do is call them: **the announce builders are not invoked on the current extension path.** That leaves a Linux host or a container as the supported configuration, and rather than letting you find that out through a nine-minute connection timeout, the module refuses up front:
 
 ```java
 @DisabledOnNonLinuxHost(
-        "Redis Sentinel tests require native Docker networking (Linux host or dev container)")
+    "Redis Sentinel tests require native Docker networking (Linux host or dev container)")
 public @interface RedisSentinel { … }
 ```
 
-The condition is smarter than JUnit's built-in `@EnabledOnOs(LINUX)`, and for a specific reason: inside a dev container running *on* macOS, `os.name` still reports `Mac OS X`. So it checks for `/.dockerenv` first — if you are in a container, you are on Linux by construction, whatever the JVM thinks — and only then falls back to `os.name`.
+JUnit ships `@EnabledOnOs(LINUX)` and it would be the wrong tool here, for one concrete reason: a dev container running *on* macOS still reports `os.name` as `Mac OS X`, and that environment works perfectly. Checking the OS alone would refuse to run tests that would have passed. So the condition looks for `/.dockerenv` first — inside a container you are on Linux by construction, whatever the JVM believes — and consults `os.name` only when that file is absent.
 
-Run the Sentinel suite on macOS and you get this, which is the *correct* behaviour: skipped, not failed, not hung.
+Run the Sentinel suite on a macOS laptop and the result is not a failure, not a hang, and not a mysterious timeout:
 
 ```sh
 ./gradlew :macstab-chaos-redis:test --tests "*SentinelFailoverTest*"
@@ -591,25 +593,25 @@ BUILD SUCCESSFUL in 2s
 
 *The same test class that runs a six-container failover in CI, on a macOS laptop.*
 
-A red build on a developer laptop for an environmental reason nobody can fix locally is a build people learn to ignore. A skip with a printed reason is a build people keep. Write the Sentinel tests, run them in CI on Linux, and they simply do not execute on the macOS laptop — the same annotation, the same code, no `if` in your test.
+That distinction decides whether the tests survive contact with a team. Hand somebody a red build caused by an environment they cannot change locally and they will learn to ignore red builds — all of them, including the ones that matter. Hand them a skip with the reason printed next to it and the suite stays trustworthy. So write your Sentinel tests once, let CI run them on Linux, and watch them quietly stand down on the macOS laptop: same annotation, same code, and not a single `if` anywhere in the test.
 
 ---
 
 ## 7. Failover as an assertion
 
-This is the payoff — the thing that was previously a week of plumbing:
+Here is what all of that machinery was for. A week of plumbing, reduced to a test method:
 
 ```java
 @RedisSentinel(replicas = 2, sentinels = 3)
 class FailoverTest {
 
-    @Test
-    void promotesWithinSlo(SentinelCluster cluster) {
-        Duration elapsed = cluster.getControl().triggerFailover(Duration.ofSeconds(30));
+  @Test
+  void promotesWithinSlo(SentinelCluster cluster) {
+    Duration elapsed = cluster.getControl().triggerFailover(Duration.ofSeconds(30));
 
-        assertThat(elapsed).isLessThan(Duration.ofSeconds(15));
-        assertThat(cluster.getControl().getMaster().isRunning()).isTrue();
-    }
+    assertThat(elapsed).isLessThan(Duration.ofSeconds(15));
+    assertThat(cluster.getControl().getMaster().isRunning()).isTrue();
+  }
 }
 ```
 
@@ -617,86 +619,88 @@ class FailoverTest {
 
 *SIGKILL → detection window → quorum → majority vote → promotion → the first poll that observes a new master.*
 
-What `triggerFailover` does, precisely:
+Step through what that single call actually performs:
 
-1. **Find the current master** — not the container that was created as master; the one that *reports* `role:master` right now. After a previous failover in the same class those differ.
-2. **`kill`, not `stop`** — `TestcontainerController.kill()` issues `killContainerCmd` (SIGKILL). This matters, and the reason is in [`signal(7)`](https://man7.org/linux/man-pages/man7/signal.7.html): `SIGTERM` is catchable, `SIGKILL` is one of the two signals POSIX guarantees a process **cannot** catch, block or ignore. `docker stop` sends SIGTERM, Redis's signal handler runs a clean shutdown, sockets are closed properly — so the Sentinels observe FINs and a refused reconnect, which is a *different* and generally faster detection path than the one your production incident took. SIGKILL models a node death: no FIN, no `ECONNREFUSED`, just a peer that stops answering, which is precisely the case `down-after-milliseconds` exists to time out. Testing the wrong one gives you a green failover test that never exercised failure detection at all.
-3. **Poll for a new master** every 500 ms up to the timeout, clearing the role cache on each iteration, because the whole point is that roles are changing underneath you.
-4. **Return the elapsed `Duration`** — kill to first observation of a different container reporting `role:master`.
-5. **Or throw `FailoverException`** carrying the timeout, the elapsed time and the retry count, rather than a bare `AssertionError`.
+1. **Locate whichever container is master at this instant.** Not the one that started life as master — the one *reporting* `role:master` right now. Run a second failover inside the same class and those two are no longer the same container.
+2. **Kill it rather than stopping it.** `TestcontainerController.kill()` issues `killContainerCmd`, which delivers SIGKILL, and [`signal(7)`](https://man7.org/linux/man-pages/man7/signal.7.html) explains why that choice is load-bearing: `SIGTERM` can be caught, while `SIGKILL` is one of only two signals POSIX guarantees a process **cannot** catch, block or ignore. Send SIGTERM via `docker stop` and Redis's handler runs an orderly shutdown, closing its sockets — so the Sentinels see FINs followed by a refused reconnect, and take a *different*, usually faster detection path than the one your production incident actually took. SIGKILL reproduces a node death instead: no FIN, no `ECONNREFUSED`, just a peer that stops replying, which is the exact condition `down-after-milliseconds` was written to time out. Pick the wrong signal and your failover test goes green having never exercised failure detection at all.
+3. **Poll every 500 ms until the timeout expires**, discarding the role cache on each pass — since roles shifting underneath you is the entire phenomenon being measured.
+4. **Hand back the elapsed `Duration`**, spanning the kill to the first sighting of a *different* container reporting `role:master`.
+5. **Or raise `FailoverException`**, carrying the timeout, the elapsed time and the retry count — not a bare `AssertionError` that tells you nothing about why.
 
-Role detection itself is worth a look, because "which container is the master" is not a question Docker can answer:
+The role detection underneath deserves its own look, because "which of these containers is currently the master" is a question Docker fundamentally cannot answer:
 
 ```java
 try (RedisClient client = RedisClient.create(uri);
-StatefulRedisConnection<String, String> conn = client.connect()) {
-final String info = conn.sync().info("replication");
+     StatefulRedisConnection<String, String> conn = client.connect()) {
+  final String info = conn.sync().info("replication");
   if (info.contains("role:master"))      return ContainerRole.MASTER;
   else if (info.contains("role:slave"))  return resolveReplicaRole(container);   // → REPLICA_n
   else                                   return ContainerRole.UNKNOWN;
 }
 ```
 
-It asks Redis, over the wire, via `INFO replication` — the same field an operator greps during an incident. Three details make it work in the environments this has to run in: Sentinels are identified structurally (they expose 26379, so they are never asked for a replication role); the connection is made to the container's **internal** Docker IP with a fallback to `host:mappedPort`, which is what makes it correct inside Docker-in-Docker where containers cannot reach each other via the host; and results are cached in a `ConcurrentHashMap` with an explicit `clearCache()` — because caching a role across a failover is how you get a test that passes for the wrong reason.
+Notice that it asks Redis rather than Docker, over the wire, through the same `INFO replication` field an operator greps at three in the morning. Three implementation details keep that honest across the environments this has to survive. Sentinels are recognised structurally — they expose 26379 — so nobody ever asks them for a replication role they do not have. Connections target the container's **internal** Docker IP and fall back to `host:mappedPort`, which is what makes it work under Docker-in-Docker, where containers genuinely cannot reach one another via the host. And while results are cached in a `ConcurrentHashMap`, that cache is cleared explicitly, because a role cached across a failover is the precise mechanism by which a test passes for entirely the wrong reason.
 
-The resulting `ContainerRole` is a semantic enum — `MASTER`, `REPLICA_0..8`, `SENTINEL_0..8`, `UNKNOWN` — so a test can say what it means:
+What comes back is a semantic enum rather than an index: `MASTER`, `REPLICA_0` through `REPLICA_8`, `SENTINEL_0` through `SENTINEL_8`, and `UNKNOWN`. Which means a test can state its intent directly:
 
 ```java
 cluster.getControl().network().injectLatency(
-        cluster.getContainer(ContainerRole.REPLICA_1), Duration.ofMillis(80));   // "the EU replica"
+    cluster.getContainer(ContainerRole.REPLICA_1), Duration.ofMillis(80));   // "the EU replica"
 ```
 
-And what you should actually assert around a failover, since the clock is only half the story: Redis replication is **asynchronous**. The master acknowledges a write before any replica has it; a promotion therefore *can* lose the tail of the write stream. That is not a bug in Redis and it is not a bug in this module — it is a deliberate position in the [PACELC](https://en.wikipedia.org/wiki/PACELC_design_principle) space (*else, latency over consistency*: absent a partition, Sentinel-managed Redis chooses to ack fast rather than wait for replicas), and it is the thing your application code is silently assuming away. With a real cluster in a test you can finally measure it: write a monotonic sequence, trigger the failover, read the sequence off the new master, and assert your actual tolerance. If your answer is "we can't lose any", the conversation you now need is about [`WAIT`](https://redis.io/docs/latest/commands/wait/), `min-replicas-to-write` and `min-replicas-max-lag` — and you can test each of those settings the same way.
+Measuring the promotion is only half of what matters, though, and the other half is less comfortable. Redis replicates **asynchronously**: your write is acknowledged before any replica holds a copy of it, which means a promotion can quietly discard the tail of the write stream. Neither Redis nor this module is misbehaving there. It is a deliberate choice of position in the [PACELC](https://en.wikipedia.org/wiki/PACELC_design_principle) space — *else, latency over consistency* — in which a Sentinel-managed Redis, absent any partition, prefers to acknowledge fast rather than wait for replicas. Your application code is already relying on that trade, almost certainly without having examined it. A real cluster in a test finally lets you put a number on it: write a monotonic sequence, trigger the failover, read the sequence back from the newly promoted master, and assert the loss you can actually tolerate. Should that answer turn out to be "none", the next conversation is about [`WAIT`](https://redis.io/docs/latest/commands/wait/), `min-replicas-to-write` and `min-replicas-max-lag` — and every one of those settings is testable by exactly the same method.
 
 ---
 
 ## 8. Now inject faults into it — two orthogonal layers
 
-A real topology is the substrate. The stack's lower layers are the tools. Two independent flags on both annotations:
+With a real topology underneath, the lower layers of the stack become usable as instruments. Two flags turn them on, and both annotations accept them:
 
 ```java
 @RedisSentinel(replicas = 2, enableNetworkChaos = true, enableConnectionChaos = true)
 ```
 
-**`enableNetworkChaos = true` — the kernel packet path.** Adds the `NET_ADMIN` capability to every node in the cluster (never `--privileged`), then installs `iproute2` and `iptables` through a distribution-detecting package installer — the same code path resolves `apt-get`, `apk`, `dnf`, `yum`, `pacman` or `zypper` from `/etc/os-release`, so it works whether your image is `redis:7.4` (Debian) or `redis:7.4-alpine`. With that in place, `control.network()` gives you per-container [`tc`/`netem`](https://man7.org/linux/man-pages/man8/tc-netem.8.html) latency, jitter, packet loss, and `iptables`-based partitions. `NET_ADMIN` is scoped to the container's own network namespace: it cannot touch the host, your VPN, or the other containers.
+**`enableNetworkChaos = true` reaches the kernel packet path.** Setting it grants `NET_ADMIN` to every node in the cluster — never `--privileged`, which would be a different and much larger promise — and then installs `iproute2` and `iptables` through a package installer that identifies the distribution first. One code path resolves `apt-get`, `apk`, `dnf`, `yum`, `pacman` or `zypper` by reading `/etc/os-release`, so a Debian-based `redis:7.4` and an Alpine-based `redis:7.4-alpine` both work without you choosing. Once that is in place `control.network()` offers per-container [`tc`/`netem`](https://man7.org/linux/man-pages/man8/tc-netem.8.html) latency, jitter and packet loss, plus partitions built on `iptables`. The capability itself stays confined to each container's own network namespace — it reaches neither the host, nor your VPN, nor any container beside it.
 
 ```java
 // one replica is "in another region"
 control.network().injectLatency(cluster.getContainer(ContainerRole.REPLICA_0), Duration.ofMillis(80));
 // … and now the split-brain question, with a real answer
-        control.network().partitionFrom(replica, master);
+control.network().partitionFrom(replica, master);
 ```
 
-**`enableConnectionChaos = true` — the libc socket layer.** Prepares `libchaos-net` on every container *before* `container.start()` — necessarily so, since the dynamic loader only honours `LD_PRELOAD` at process launch. From there you get per-syscall errno injection on `connect`, `bind`, `accept`, `send`, `recv` and `poll`, plus fault classes a TCP proxy structurally cannot reach: UDP, unix sockets, DNS resolution, `recv` corruption, file-descriptor exhaustion. Verbs it cannot model — bandwidth shaping — fall through automatically to a lazily-spawned Toxiproxy sidecar inside `CompositeConnectionChaos`.
+**`enableConnectionChaos = true` works one level lower, at the libc socket layer.** It arranges `libchaos-net` on each container *before* `container.start()` runs, and the ordering is not stylistic: the dynamic loader reads `LD_PRELOAD` at process launch and never again. What that unlocks is errno injection on individual syscalls — `connect`, `bind`, `accept`, `send`, `recv`, `poll` — together with a set of faults no TCP proxy can structurally reach: UDP traffic, unix sockets, DNS resolution, corruption of `recv` buffers, exhaustion of file descriptors. The one verb it cannot express is bandwidth shaping, and that falls through on its own to a Toxiproxy sidecar which `CompositeConnectionChaos` spawns lazily when first needed.
 
 ![FIG-07 · two orthogonal fault layers](./images/redis-07-two-fault-layers.png)
 
 *One flag shapes the kernel packet path; the other fails the libc socket call the process made. Different layers, different failures, both on the same cluster.*
 
-The two are genuinely orthogonal and compose: `netem` reshapes packets on the wire, `libchaos-net` fails the syscall the process made. A retry loop that survives 5 % packet loss can still die on a single `ECONNRESET` from `send()`, and the point of having both is that you find out which.
+Those two are not alternatives, and they compose freely, because they operate on different things: `netem` reshapes packets already on the wire, while `libchaos-net` breaks the syscall the process just issued. The difference is not academic. A retry loop can shrug off 5 % packet loss all day and still fall over on one `ECONNRESET` returned from `send()`. Finding out which of those describes your code is the entire reason both exist.
 
-The provider resolution deserves a paragraph, because it is three patterns stacked and the failure mode is otherwise mystifying. `control.connection()` performs a two-step lookup: first `CompositeConnectionChaos.standard()` reflectively, then [`ServiceLoader`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/ServiceLoader.html) — the **service provider interface** mechanism specified by the [JAR file specification](https://docs.oracle.com/en/java/javase/21/docs/specs/jar/jar.html#service-provider) (`META-INF/services/<fully.qualified.Interface>`, one implementation class per line; this module ships exactly such a file for `ChaosPlugin`, which is how `RedisPlugin` is discovered without anyone importing it). What it returns is a **Composite** wrapping a **Chain of Responsibility**: every verb is offered to the `libchaos-net` layer first and falls through to Toxiproxy only for what the syscall layer cannot model. And the whole resolution sits behind **double-checked locking** over a `volatile` field — the idiom that was [broken before JSR-133](https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html) and correct after it, because the Java Memory Model ([JLS §17.4](https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.4)) gives a `volatile` write a happens-before edge to the subsequent read, so no thread can observe a partially-constructed provider:
+Spend a paragraph on how that provider gets resolved, because three patterns are stacked inside it and the failure mode is baffling without knowing them. Calling `control.connection()` triggers a two-step lookup: `CompositeConnectionChaos.standard()` reflectively first, and failing that [`ServiceLoader`](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/ServiceLoader.html) — the **service provider interface** defined by the [JAR file specification](https://docs.oracle.com/en/java/javase/21/docs/specs/jar/jar.html#service-provider), where `META-INF/services/<fully.qualified.Interface>` lists one implementation per line. This module ships precisely such a file for `ChaosPlugin`, which is how `RedisPlugin` gets discovered although nothing imports it.
+
+The object that comes back is a **Composite** wrapping a **Chain of Responsibility**: each verb is offered to the `libchaos-net` layer first, and only what the syscall layer genuinely cannot model falls through to Toxiproxy. Guarding the whole lookup is **double-checked locking** over a `volatile` field — an idiom that was [outright broken before JSR-133](https://www.cs.umd.edu/~pugh/java/memoryModel/DoubleCheckedLocking.html) and became correct afterwards, because the Java Memory Model ([JLS §17.4](https://docs.oracle.com/javase/specs/jls/se21/html/jls-17.html#jls-17.4)) establishes a happens-before edge from a `volatile` write to the read that follows it. No thread can catch the provider half-built:
 
 ```java
 private volatile ConnectionChaos connectionChaos;      // volatile is load-bearing, not decoration
 
 public ConnectionChaos connection() {
-    ConnectionChaos local = connectionChaos;             // one volatile read on the hot path
-    if (local == null) {
-        synchronized (this) {
-            local = connectionChaos;
-            if (local == null) { local = resolveConnectionChaos(); connectionChaos = local; }
-        }
+  ConnectionChaos local = connectionChaos;             // one volatile read on the hot path
+  if (local == null) {
+    synchronized (this) {
+      local = connectionChaos;
+      if (local == null) { local = resolveConnectionChaos(); connectionChaos = local; }
     }
-    return local;
+  }
+  return local;
 }
 ```
 
-If neither route resolves, the `IllegalStateException` names both fixes — set `enableConnectionChaos = true`, or add the `macstab-chaos-connection` dependency. And there is deliberately **no Null Object fallback** for syscall-level verbs: a container that was not prepared before start surfaces `LibchaosNotPreparedException` at the call site rather than silently doing nothing. A chaos framework that no-ops when misconfigured produces green builds that prove nothing, which is strictly worse than a red one.
+Should both routes come up empty, the resulting `IllegalStateException` spells out both remedies: set `enableConnectionChaos = true`, or put `macstab-chaos-connection` on the classpath. One design choice underpins that message. For syscall-level verbs there is deliberately **no Null Object fallback** — hand it a container that was never prepared before start and you get `LibchaosNotPreparedException` at the call site, loudly. The alternative would be a framework that quietly does nothing when misconfigured, and a chaos suite that no-ops produces green builds proving precisely nothing, which is a worse outcome than any red one.
 
 ### The incident packs: compound faults, one annotation
 
-Above the primitives, `macstab-chaos-testpacks-l3-redis` ships method-level annotations that compose multiple domains into one named incident. These are not wrappers around a single toxic — they are the multi-domain shapes real outages have:
+One level up from those primitives sits `macstab-chaos-testpacks-l3-redis`, whose method-level annotations bundle several fault domains into a single named incident. The distinction matters: these are not convenience wrappers around one toxic. Each reproduces the multi-domain shape an actual outage has:
 
 ```java
 @Test
@@ -713,37 +717,37 @@ void sentinelSurvivesResetStorm(SentinelCluster cluster) { … }
 | `@IncidentChaosRedisCacheAvalanche` | synchronised expiry storm under read concurrency |
 | `@IncidentChaosRedisSlowlog` | injected latency that pushes operations into `SLOWLOG` territory |
 
-The clock-drift ones deserve a note, because they hit a piece of Sentinel most engineers have never met: **[TILT mode](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#tilt-mode)**. Sentinel's timer interrupt fires ten times a second, so it expects roughly 100 ms between calls. It records the previous call time and compares — and, in the documentation's words, "if the time difference is negative or unexpectedly big (2 seconds or more) the TILT mode is entered". While in TILT a Sentinel "will continue to monitor everything, but: it stops acting at all" and "starts to reply negatively to `SENTINEL is-master-down-by-addr` requests as the ability to detect a failure is no longer trusted" — so it also stops helping *other* Sentinels reach ODOWN. It leaves TILT after 30 seconds of normality. The protection exists so that a suspended VM or an NTP step does not cause a cluster-wide phantom failover.
+Pause on the clock-drift entries, because they reach a corner of Sentinel most engineers never encounter: **[TILT mode](https://redis.io/docs/latest/operate/oss_and_stack/management/sentinel/#tilt-mode)**. Sentinel's timer fires ten times a second, so roughly 100 ms should separate any two invocations; it records the previous timestamp and compares on every pass. Quoting the documentation, "if the time difference is negative or unexpectedly big (2 seconds or more) the TILT mode is entered". What happens next is the interesting part. A tilted Sentinel "will continue to monitor everything, but: it stops acting at all", and it "starts to reply negatively to `SENTINEL is-master-down-by-addr` requests as the ability to detect a failure is no longer trusted" — meaning it withdraws not only its own action but its help in getting *anyone else* to ODOWN. Thirty seconds of normality bring it back. The whole mechanism exists so a suspended VM or an NTP step cannot trigger a phantom failover across the cluster.
 
-And it is directly assertable, which is the part that makes it a test rather than a lecture: `INFO` on a Sentinel exposes `sentinel_tilt` and `sentinel_tilt_since_seconds` (`-1` when not tilted). Skew `CLOCK_REALTIME` inside a Sentinel container by more than two seconds and you can assert that the HA layer entered its protective coma — and then assert what your application does during the half-minute when nothing will be promoted no matter what dies.
+None of which would be worth much if you could not observe it — but `INFO` on a Sentinel reports `sentinel_tilt` alongside `sentinel_tilt_since_seconds`, the latter reading `-1` whenever it is not tilted. So the whole thing becomes a test rather than a lecture: skew `CLOCK_REALTIME` past two seconds inside a Sentinel container, assert that your HA layer has entered its protective coma, and then assert the behaviour that actually concerns you — what your application does across the thirty seconds during which nothing will be promoted regardless of what dies. VM live-migration produces this. So does an NTP correction after a long drift, or a container resumed from a pause. And short of waiting for one of them in production, there is essentially no other way to rehearse it.
 
-Which means: skew the realtime clock inside a Sentinel container and you can test whether your system survives the case where the HA layer has deliberately, correctly, and silently gone dormant for half a minute. That is a genuine production scenario — VM live-migration, an NTP correction after a long drift, a paused container — and there is essentially no other way to rehearse it. It is also why `libchaos-time` sits *below* the JVM: `System.currentTimeMillis()` is a JIT intrinsic inlined to the vDSO, and Redis's own `mstime()` bottoms out at the same place. You cannot fake this from inside the JVM. You can from underneath libc.
+It is also why `libchaos-time` sits *below* the JVM. `System.currentTimeMillis()` is a JIT intrinsic inlined to the vDSO, and Redis's own `mstime()` bottoms out in the same place. You cannot fake this from inside the JVM. You can from underneath libc.
 
 ---
 
 ### The failure your Sentinel cluster will never fail over for
 
-Which brings us back to the failure this article opened with — because everything between here and there assumed the interesting failure is a node *dying*, and that one isn't.
+All of which returns us to the failure this article started on. Everything between that opening and this paragraph has quietly assumed the interesting failure is a node *dying*. The one that cost me a night does not involve anything dying at all.
 
-Redis's `stop-writes-on-bgsave-error` defaults to `yes`. If a background snapshot fails — a full disk, a read-only mount, an `EIO` on `write` from a single `libchaos-io` rule — Redis refuses every command that could modify the data set. Not the connection. Not the process. Just writes. It takes about ten seconds to reproduce, and here it is against a real Redis 7.4.8:
+The setting responsible is `stop-writes-on-bgsave-error`, and it defaults to `yes`. Let a background snapshot fail — a full disk, a read-only mount, or a single `libchaos-io` rule returning `EIO` on `write` — and Redis begins refusing every command capable of modifying the data set. The connection stays up. The process stays up. Only writes stop. Reproducing it takes about ten seconds against a real Redis 7.4.8:
 
 ![FIG-T4 · MISCONF — reads fine, writes refused, no failover](./images/term-04.png)
 
 *The disk went read-only under a running master. `GET` still answers. `SET` does not. `rdb_last_bgsave_status:err`.*
 
-Now walk the topology. The master is **not** down: it accepts connections, answers `PING`, serves reads, and streams replication. Sentinel's health check is exactly that `PING` — the documentation describes it as remembering "the time of the latest successful reply to the `PING` command". So there is no SDOWN, therefore no ODOWN, therefore no election, therefore **no failover — ever**. Your liveness probe is green. Your replicas are in sync. Your dashboard is calm. And every write in the system has been failing since the disk filled up.
+Now trace that state through the topology, because the conclusion is worse than it first appears. By every definition Sentinel uses, the master is **not** down: it accepts connections, answers `PING`, serves reads, and keeps streaming replication. And `PING` is precisely what Sentinel's health check watches — the documentation describes it as remembering "the time of the latest successful reply to the `PING` command". No SDOWN follows. Without SDOWN there is no ODOWN, without ODOWN no election, and without an election **no failover — not now, not in an hour, not ever**. Meanwhile your liveness probe reports green, your replicas remain in sync, your dashboard stays flat, and every write in the system has been failing since the moment the disk filled up.
 
-That is a class of incident that infrastructure chaos cannot produce (nothing died) and a mocked `RedisTemplate` cannot produce (the mock does not have a disk). It takes a real Redis, a real durability configuration, and a fault at the syscall layer — which is precisely the three-layer stack this article sits at the top of. And the assertion is one line: after injecting the fault, your write path must surface a specific, actionable error rather than silently dropping the write or retrying forever.
+Ask which of your existing tools could have caught that. Infrastructure chaos cannot, because nothing died for it to notice. A mocked `RedisTemplate` cannot either, for the simpler reason that a mock has no disk to fail. Producing this state requires a real Redis, running a real durability configuration, meeting a fault injected at the syscall layer — which is exactly the three layers this article sits on top of. And having reproduced it, the assertion you write is one line long: with the fault active, your write path must raise a specific, actionable error, rather than dropping writes on the floor or retrying until the end of time.
 
 ---
 
 ## 9. Proving what your client library actually did
 
-A topology that runs is one thing. Evidence about what happened inside it is another, and it is where "we have a Redis integration test" turns into "we have a proof".
+Getting the topology running is the easy half. Extracting evidence about what happened inside it is the half that upgrades "we have a Redis integration test" into "we can prove what our client did".
 
 ### `MONITOR`, wired into assertions
 
-`RedisCommandTracker` is the **Observer** pattern in its purely passive form — it changes nothing about the system under test, it only watches. It attaches to a container's [`MONITOR`](https://redis.io/docs/latest/commands/monitor/) stream (a [RESP](https://redis.io/docs/latest/develop/reference/protocol-spec/) stream of simple status replies, one line per command, carrying timestamp, client address, database index and the command with its arguments), consumed frame-by-frame on a daemon thread:
+Watching, not participating, is the whole design of `RedisCommandTracker` — the **Observer** pattern with nothing added. It alters no behaviour in the system under test. What it does is attach to a container's [`MONITOR`](https://redis.io/docs/latest/commands/monitor/) output: a [RESP](https://redis.io/docs/latest/develop/reference/protocol-spec/) stream of simple status replies, one per command executed, each carrying a timestamp, the client address, the database index and the command with all its arguments. A daemon thread consumes that frame by frame:
 
 ```java
 var tracker = new RedisCommandTracker(cluster.getReplicaContainers().get(0));
@@ -756,40 +760,40 @@ tracker.assertThat()
     .hasNoDangerousCommands();        // and nothing issued KEYS / FLUSHALL
 ```
 
-That is the assertion nobody can write against a mock: **did my read/write splitting actually route reads to the replica**, or is the `ReadFrom.REPLICA_PREFERRED` setting in my config silently ineffective because of how the connection was built? Run one tracker on the master and one on a replica, count `GET` on each, and the answer is arithmetic instead of belief.
+Consider the question that snippet settles, and how you would answer it otherwise. **Did the read/write splitting actually send reads to the replica** — or is the `ReadFrom.REPLICA_PREFERRED` line in your configuration doing nothing at all, because of how the connection ended up being constructed? No mock can tell you; it will happily confirm whatever you programmed it to confirm. Attach one tracker to the master, another to a replica, count `GET` on each, and belief turns into arithmetic.
 
-Around that core the tracker exposes counting by command, counting by key pattern (`countCommandsMatchingKeyPattern("GET", "user:*")`), category rollups (READ / WRITE / ADMIN / PUBSUB / TRANSACTION / SCRIPTING / STREAM) and a read/write ratio, hot-key detection (top-N by access count — the tenant that will hotspot a shard), inter-arrival timing per command, and a static `measureReplicationLag(master, replica)`.
+Built around that core are the queries you end up wanting next: counts by command; counts by key pattern, via `countCommandsMatchingKeyPattern("GET", "user:*")`; rollups by category across READ, WRITE, ADMIN, PUBSUB, TRANSACTION, SCRIPTING and STREAM, with a read/write ratio on top; hot-key detection by top-N access count, which is how you find the tenant about to hotspot a shard; per-command inter-arrival timing; and a static `measureReplicationLag(master, replica)`.
 
-Three honest caveats. The capture buffer is a `CopyOnWriteArrayList`, which makes concurrent reads from assertion code free but copies the whole backing array on **every** captured line — fine for the hundreds of commands a focused test produces, quadratic if you point it at a load generator. Keep the observation window tight, or supply a narrower filter.
+Three caveats belong with it, all of them structural rather than incidental. First, the capture buffer is a `CopyOnWriteArrayList`. That makes concurrent reads from your assertion code free, and it copies the entire backing array on **every single captured line** — perfectly fine for the few hundred commands a focused test emits, and quadratic the instant somebody aims it at a load generator. Keep the observation window narrow, or hand it a tighter filter.
 
-`MONITOR` is a debugging command with a real throughput cost — [Redis's own documentation](https://redis.io/docs/latest/commands/monitor/) measures a single `MONITOR` client reducing throughput by **more than 50 %**, and more clients cost more — so it belongs in targeted tests, on the node you are making a claim about, never switched on across a suite or used to measure performance. And the default line filter excludes replication traffic with the heuristic "the line contains `:6379]`", which is a pragmatic string match on the MONITOR client-address field, not a protocol-level distinction; supply your own `Predicate<String>` through the constructor if your topology makes that ambiguous. Also note the deprecation that tells the truth: `getAverageLatency()` is deprecated in favour of `getAverageCommandGap()`, because `MONITOR` timestamps tell you *when commands arrived*, not how long they took. Renaming that instead of quietly shipping a wrong number is the correct call.
+Second, `MONITOR` is expensive in a way that is easy to underestimate: [Redis's own documentation](https://redis.io/docs/latest/commands/monitor/) benchmarks a single `MONITOR` client cutting throughput by **more than 50 %**, and additional clients cost more again. Use it on the one node you are making a claim about, in the one test making that claim — never across a suite, and never as a measurement instrument for performance. Third, the default line filter drops replication traffic by asking whether "the line contains `:6379]`", which is a pragmatic string match on the MONITOR client-address field and not a protocol-level distinction; if your topology makes that ambiguous, pass your own `Predicate<String>` to the constructor. One last detail, because it is the kind that builds trust: `getAverageLatency()` was deprecated in favour of `getAverageCommandGap()`, since MONITOR timestamps record *when a command arrived* and say nothing about how long it took. An awkward accurate name beats a comfortable wrong number.
 
 ### The inspector set
 
-Four focused tools, each usable either shell-backed (`redis-cli` inside the container, no client dependency) or Lettuce-backed (typed, faster):
+Four narrower tools sit alongside the tracker. Each runs in one of two modes — shell-backed through `redis-cli` inside the container, which needs no client dependency at all, or Lettuce-backed, which is typed and faster:
 
-- **`SlowCommandDetector`** — typed `SLOWLOG GET` / `RESET`. The Lettuce backend decodes the raw wire shape (`[id, unix-seconds, duration-µs, [command, args…], client-addr, client-name]`) so you can assert "no command exceeded 10 ms under this fault" rather than eyeballing a log.
-- **`ConnectionLeakTracker`** — `CLIENT LIST` diffing. Snapshot before, compare after: the connection-pool leak that only shows up after a reconnect storm, caught in CI.
-- **`MemorySnapshotAnalyzer`** — `INFO memory` baseline versus current, for the write-then-delete pattern that should return to its starting footprint and sometimes doesn't.
-- **`ReplicationConsistencyVerifier`** — writes N unique keys to the master, polls the replica until all arrive or the timeout expires, and reports matching/missing counts. `verifier.verify(50).assertFullConsistency()` is a one-line answer to "how far behind is the replica under 80 ms of injected latency".
+- **`SlowCommandDetector`** turns `SLOWLOG GET` and `RESET` into typed calls. Its Lettuce backend unpacks the raw wire shape — `[id, unix-seconds, duration-µs, [command, args…], client-addr, client-name]` — so that "no command exceeded 10 ms while this fault was active" becomes an assertion instead of something you squint at in a log.
+- **`ConnectionLeakTracker`** diffs `CLIENT LIST` across a boundary. Snapshot first, compare afterwards, and the connection-pool leak that only manifests after a reconnect storm stops being a production discovery and starts being a CI failure.
+- **`MemorySnapshotAnalyzer`** holds an `INFO memory` baseline against the current reading — aimed squarely at the write-then-delete cycle that ought to return to its starting footprint and occasionally does not.
+- **`ReplicationConsistencyVerifier`** writes N unique keys to the master and polls the replica until either all of them land or the timeout wins, reporting how many matched and how many are missing. One line, `verifier.verify(50).assertFullConsistency()`, answers "how far behind does this replica fall under 80 ms of injected latency".
 
 ### Which node is this connection actually on?
 
-`ControlFacade.inspect(connection)` maps a live Lettuce connection back to the container serving it, in three tiers: auto-detection (extract the endpoint from the connection, match it against the known containers, resolve the role), an explicit container hint when auto-detection cannot see through your setup, and fully manual construction. It returns a `ConnectionInfo` carrying the role, the container and a health flag — so after a failover you can assert that your client *followed* the promotion instead of politely reconnecting to a demoted replica and reading stale data for the next four minutes. Tier 1 depends on Lettuce's connection `toString()` shape, which is why tiers 2 and 3 exist; when auto-detection fails it throws with the string it could not parse rather than guessing.
+`ControlFacade.inspect(connection)` answers that by mapping a live Lettuce connection back to the container actually serving it, and it does so in three tiers. Auto-detection pulls the endpoint out of the connection, matches it against the containers it knows, and resolves the role. An explicit container hint takes over when auto-detection cannot see through whatever you have built. Manual construction covers the rest. Either way you receive a `ConnectionInfo` carrying role, container and health flag — which is what lets you assert, after a failover, that your client genuinely *followed* the promotion instead of reconnecting politely to a demoted replica and serving stale reads for the next four minutes. That first tier necessarily depends on the shape of Lettuce's `toString()`, which is why the other two exist at all; and when it cannot parse, it throws with the string that defeated it rather than guessing.
 
 ---
 
 ## 10. The recipes
 
-**Cache eviction behaviour** — a bounded Redis, so the `allkeys-lru` policy your production config sets is actually exercised:
+**Testing eviction for real.** Bound the memory and the `allkeys-lru` policy sitting in your production config finally gets exercised rather than assumed:
 
 ```java
 @RedisStandalone(version = "7.4",
-        args = {"--maxmemory", "32mb", "--maxmemory-policy", "allkeys-lru"})
+    args = {"--maxmemory", "32mb", "--maxmemory-policy", "allkeys-lru"})
 class EvictionTest { }
 ```
 
-**Several independent stores** — cache, sessions, rate limiter, started concurrently, isolated by construction:
+**Three stores that cannot contaminate each other.** A cache, a session store and a rate limiter, brought up concurrently and isolated by construction rather than convention:
 
 ```java
 @RedisStandalone(id = "cache",        version = "7.4")
@@ -798,47 +802,47 @@ class EvictionTest { }
 class MultiStoreTest { }
 ```
 
-**HA, with a Sentinel-aware client.** Lettuce, using the sentinel endpoints the cluster reports (and `mymaster`, per §6.4):
+**Wiring a Sentinel-aware client to the HA cluster.** Lettuce here, built from the sentinel endpoints the cluster hands back — and pinned to `mymaster` for the reason set out in §6.4:
 
 ```java
 @RedisSentinel(replicas = 2, sentinels = 3)
 class SentinelClientTest {
 
-    @Test
-    void clientDiscoversMasterThroughSentinel(SentinelRedis cluster) {
-        RedisURI.Builder uri = RedisURI.Builder
-                .sentinel(cluster.sentinels().get(0).host(), cluster.sentinels().get(0).port(), "mymaster");
-        cluster.sentinels().stream().skip(1).forEach(s -> uri.withSentinel(s.host(), s.port()));
+  @Test
+  void clientDiscoversMasterThroughSentinel(SentinelRedis cluster) {
+    RedisURI.Builder uri = RedisURI.Builder
+        .sentinel(cluster.sentinels().get(0).host(), cluster.sentinels().get(0).port(), "mymaster");
+    cluster.sentinels().stream().skip(1).forEach(s -> uri.withSentinel(s.host(), s.port()));
 
-        RedisClient client = RedisClient.create(uri.build());
-        try (var conn = client.connect()) {
-            assertThat(conn.sync().ping()).isEqualTo("PONG");
-        } finally {
-            client.shutdown();
-        }
+    RedisClient client = RedisClient.create(uri.build());
+    try (var conn = client.connect()) {
+      assertThat(conn.sync().ping()).isEqualTo("PONG");
+    } finally {
+      client.shutdown();
     }
+  }
 }
 ```
 
-Jedis, same idea:
+The Jedis equivalent, unchanged in shape:
 
 ```java
 Set<String> nodes = cluster.sentinels().stream().map(Endpoint::toString).collect(toSet());
 JedisSentinelPool pool = new JedisSentinelPool("mymaster", nodes);
 ```
 
-**Spring Boot** — the extension publishes the first cluster's sentinel address as the `sentinel.nodes` system property, and clears it in `afterAll`; for standalone, resolve the instance in a `@DynamicPropertySource`:
+**Dropping it into Spring Boot.** For Sentinel the extension does the work already: it publishes the first cluster's address into the `sentinel.nodes` system property and clears it again in `afterAll`. For a standalone instance, resolve it yourself inside a `@DynamicPropertySource`:
 
 ```java
 @DynamicPropertySource
 static void redisProperties(DynamicPropertyRegistry registry) {
-    StandaloneRedis redis = RedisStandalone.INSTANCE.get("cache");
-    registry.add("spring.data.redis.host", redis::host);
-    registry.add("spring.data.redis.port", redis::port);
+  StandaloneRedis redis = RedisStandalone.INSTANCE.get("cache");
+  registry.add("spring.data.redis.host", redis::host);
+  registry.add("spring.data.redis.port", redis::port);
 }
 ```
 
-**Mixed topology** — one HA cluster and two lightweight caches in a single class, eight containers, inside budget:
+**Mixing topologies in one class.** An HA cluster alongside two lightweight caches — eight containers in total, comfortably inside the budget:
 
 ```java
 @RedisSentinel(id = "ha-cluster", replicas = 2, sentinels = 3)
@@ -846,29 +850,29 @@ static void redisProperties(DynamicPropertyRegistry registry) {
 @RedisStandalone(id = "session", version = "7.2")
 class MixedTopologyTest {
 
-    @BeforeAll
-    static void started(List<SentinelRedis> clusters, List<StandaloneRedis> standalones) {
-        assertThat(clusters).hasSize(1);
-        assertThat(standalones).hasSize(2);
-    }
+  @BeforeAll
+  static void started(List<SentinelRedis> clusters, List<StandaloneRedis> standalones) {
+    assertThat(clusters).hasSize(1);
+    assertThat(standalones).hasSize(2);
+  }
 }
 ```
 
-**The full stack, in one class** — a real HA topology, syscall-level faults prepared at process launch, and a named incident scoped to a single test method:
+**Everything at once.** A genuine HA topology, syscall-level faults armed at process launch, and a named incident scoped to exactly one test method:
 
 ```java
 @RedisSentinel(replicas = 2, sentinels = 3, enableConnectionChaos = true)
 class RedisResilienceTest {
 
-    @Test
-    @IncidentChaosRedisNetworkFlap
-    void clientRecoversFromResetStorm(SentinelCluster cluster) {
-        await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
-            try (var conn = pool.getResource()) {
-                assertThat(conn.ping()).isEqualTo("PONG");
-            }
-        });
-    }
+  @Test
+  @IncidentChaosRedisNetworkFlap
+  void clientRecoversFromResetStorm(SentinelCluster cluster) {
+    await().atMost(Duration.ofSeconds(30)).untilAsserted(() -> {
+      try (var conn = pool.getResource()) {
+        assertThat(conn.ping()).isEqualTo("PONG");
+      }
+    });
+  }
 }
 ```
 
@@ -876,7 +880,7 @@ class RedisResilienceTest {
 
 ## 11. The design, named
 
-Nothing in this module is novel construction; all of it is well-known patterns applied where their trade-offs happen to be right. Naming them is not decoration — it is what lets you predict the failure modes before you hit them, and it is the map for anyone extending the module to Postgres, Kafka or Cassandra, where the shape is identical and only the topology knowledge changes.
+There is no invention in this module. Every piece of it is a well-known pattern, chosen because its particular trade-offs happen to fit the problem in front of it. Naming them serves two purposes beyond decoration. Knowing which pattern you are looking at tells you its failure modes before you meet them in production. And the list doubles as a map for anyone porting this shape to Postgres, Kafka or Cassandra — where the architecture is unchanged and only the topology knowledge has to be rewritten.
 
 | Component | Pattern | Specification / source |
 |---|---|---|
@@ -910,33 +914,33 @@ Nothing in this module is novel construction; all of it is well-known patterns a
 
 ## 12. Honest scope
 
-What this module is not, and where its edges are:
+Every tool has a boundary. These are this one's, stated before you find them yourself:
 
-- **Not Redis Cluster.** OSS Cluster mode — hash slots, `MOVED`/`ASK` redirection, resharding — is out of scope today. `RedisTopology.CLUSTER` exists in the enum; the provisioning does not.
-- **Sentinel is Linux-host or in-container only.** §6.5. Enforced as a *skip*, with the reason printed.
+- **Redis Cluster is not covered.** Hash slots, `MOVED` and `ASK` redirection, resharding — none of OSS Cluster mode is provisioned today. The enum carries a `RedisTopology.CLUSTER` constant; nothing behind it builds one.
+- **Sentinel runs on a Linux host or inside a container, nowhere else.** The reasoning is in §6.5, and the enforcement is a *skip* that prints why.
 - **Three `@RedisSentinel` attributes are not plumbed** — `quorum`, `version`, and `masterName` (the Sentinel config monitors `mymaster` and the nodes are `redis:7-alpine`). Defaults behave correctly; non-defaults are silently ignored. Documented here rather than discovered by you.
-- **`--port` in `args` breaks port resolution.** The module resolves the host port via `getMappedPort(6379)`; move Redis's internal port and that lookup finds nothing. The constant carries this warning in its own Javadoc, which is the right place for it, but it belongs here too.
-- **The memory budget is nominal**, not measured, and it is per test class, not per JVM or per runner.
-- **Containers are ephemeral.** No persistence, no volume, no reuse. Data dies with the class — which is the correct default for tests, and means this is not the tool for testing AOF/RDB recovery across restarts.
-- **`MONITOR` costs throughput**, and its capture buffer is copy-on-write. Targeted use only.
+- **Passing `--port` through `args` breaks port resolution.** Host ports are resolved by `getMappedPort(6379)`, so relocating Redis's internal port leaves that lookup with nothing to find. The constant's own Javadoc warns about it — correctly — but it deserves repeating somewhere you will actually read.
+- **The memory budget is a nominal figure**, never a measurement, and it is scoped per test class rather than per JVM or per runner.
+- **Nothing survives the class.** No persistence, no mounted volume, no container reuse — data dies alongside the test class. That is the right default for testing, and it also means this is the wrong tool for exercising AOF or RDB recovery across a restart.
+- **`MONITOR` is not free**, and its capture buffer copies on write. Point it at one node, in one test.
 - **`SentinelCluster.getControl()` is lazier than it looks.** Its Javadoc says double-checked locking; the implementation is `AtomicReference.updateAndGet(…)`, whose contract explicitly permits the mapping function to be **re-applied** when a CAS loses under contention. Two threads racing the first call can therefore each build a `ControlFacade`, one of which is discarded. Harmless here — the facade is stateless at construction and the winner is published atomically — but it is not the idiom the Javadoc names, and it would matter if construction ever acquired a resource.
 - **`CloseableResource` is deprecated as of JUnit 5.13.** The module targets 5.12.2, where the interface is still `@API(status = STABLE)` — verified in the jar — so nothing is wrong today. But 5.13 deprecated it: *"By default, `AutoCloseable` objects put into `ExtensionContext.Store` are now treated like instances of `CloseableResource` (which has been deprecated)."* A JUnit bump turns this into a two-inner-class change (`CloseableStoreMap` and `ThreadLocalCleanup` implement `AutoCloseable` instead) — worth knowing before a release note surprises you.
-- **A 2 s `down-after-milliseconds` is tight** on a loaded laptop or a noisy runner. Fine for "did it fail over"; raise it for "it must not fail over".
-- **Startup is not free.** A standalone container is a fraction of a second on a warm image cache; a six-container Sentinel cluster is seconds, dominated by replication convergence and the stabilisation window. Class-scoped provisioning amortises that across every method in the class — use it.
+- **Two seconds of `down-after-milliseconds` leaves little headroom** on a loaded laptop or a runner with noisy neighbours. It holds up fine for "did a failover happen"; widen it whenever the assertion is "no failover should have happened".
+- **Provisioning costs real time.** A single standalone container is a fraction of a second against a warm image cache, while a six-container Sentinel cluster runs into seconds — most of it replication convergence plus the stabilisation window. Class-scoped provisioning spreads that cost over every method in the class, which is the whole reason to write tests that share one.
 
 ---
 
 ## 13. What this buys
 
-Every layer of this stack exists to convert something unrehearsable into something a pull request can be red about. Layer 1 does it for syscalls: `EIO` on the third write to the WAL, `ECONNRESET` on 3 % of sends, a clock forty seconds fast. Layer 2 does it for the JVM: a checked exception thrown from a method that does not declare it, a return value nulled at 50 % probability.
+One goal unites every layer of this stack: taking a failure you cannot rehearse and turning it into something a pull request can go red over. At Layer 1 that means syscalls — `EIO` on the third write to the WAL, `ECONNRESET` on 3 % of sends, a clock running forty seconds fast. At Layer 2 it means the JVM — a checked exception thrown from a method that never declared it, a return value nulled at 50 % probability.
 
-This layer does it for **topology**. One master, two replicas, three Sentinels, a quorum, a private network, correct startup ordering, semantic wait strategies, a `SIGKILL` at the moment of your choosing, and a `Duration` you can assert against — expressed as one annotation on one class, torn down automatically, skipped honestly where it cannot run, and budget-checked before it can eat your CI runner.
+At this layer it means **topology**. A master, two replicas, three Sentinels, a correct quorum, a private network, an enforced startup order, wait strategies that key off semantic signals, a `SIGKILL` delivered exactly when you choose, and a `Duration` you can put an assertion around. All of it declared as one annotation on one class — torn down without being asked, skipped honestly wherever it cannot run, and budget-checked before it has a chance to exhaust your CI runner.
 
-The measured cost, on the slowest supported platform: eleven tests across two classes and three containers, sixteen seconds end to end including compilation. The Sentinel suite on the same machine: four tests, skipped with a printed reason, two seconds.
+And the price, measured on the slowest platform it supports: sixteen seconds end to end, compilation included, for eleven tests across two classes and three containers. The Sentinel suite on that same laptop costs two seconds and four printed skips.
 
-`SIGKILL` on a pod tells you *whether* your system dies. A real Sentinel cluster in a JUnit test tells you **what your client library actually does** while the master is being promoted — which connection it holds, which node it reads from, how many writes it lost, and how long it took to notice.
+Killing a pod answers exactly one question: *does the system die?* Put a real Sentinel cluster inside a JUnit test and you get the answer that actually changes your code — **what your client library does while a promotion is happening**. Which connection it is still holding. Which node it reads from in the meantime. How many writes went missing. And how long it took to notice any of it.
 
-**Repo:** [github.com/macstab/chaos-testing](https://github.com/macstab/chaos-testing) · module `macstab-chaos-redis` · Apache 2.0 · built against the Java 25 toolchain · JUnit 5 · Testcontainers · Lettuce-aware, client-agnostic
+**Find it here:** [github.com/macstab/chaos-testing](https://github.com/macstab/chaos-testing), module `macstab-chaos-redis` · Apache 2.0 · built on the Java 25 toolchain · JUnit 5 and Testcontainers · Lettuce-aware while staying client-agnostic
 
 ---
 
@@ -944,7 +948,7 @@ The measured cost, on the slowest supported platform: eleven tests across two cl
 
 ### 🎬 Watch the stack, bottom to top
 
-Two episodes are out now — start with either:
+Two episodes have already shipped. Either one is a reasonable place to begin:
 
 - ▶️ **[The Macstab Chaos Stack — Testing the Vertical From Syscall to CI Pipeline](https://youtu.be/jxdcB84Q3bk)** *(00-0, the overview)* — how the three layers fit together, and why each one exists. Also [on Medium](https://medium.com/@schnapka.christian/the-macstab-chaos-stack-testing-the-vertical-from-syscall-to-ci-pipeline-03d96522a3a4).
 - ▶️ **[You Tested the Catch Block. You Never Tested the Failure — 6 C99 Libraries That Fix It](https://youtu.be/B671lp4fKp8)** *(00-1, Layer 1)* — the `LD_PRELOAD` interposition underneath everything in this article: the `ECONNRESET` that `enableConnectionChaos` injects, the `EIO` that produces the `MISCONF` failure above, and the clock skew that puts a Sentinel into TILT. **If one thing here made you curious, make it this one** — it is the layer that makes the faults in this article real rather than simulated.
@@ -955,21 +959,21 @@ Two episodes are out now — start with either:
 - 🧪 **Layer 3 (00-3):** the testing library — `@ChaosTest`, `ChaosSession`, `ActivationPolicy`, and deterministic, seeded fault sequences.
 - ✍️ **The full series on Medium:** [medium.com/@macstab](https://medium.com/@macstab).
 
-📺 **This episode (00-4) on video is in production** — the Sentinel cluster coming up, the master dying, and the promotion clock, on camera. Subscribe on **[Macstab Engineering](https://www.youtube.com/@MacstabEngineering)** to catch it.
+📺 **The video for this episode (00-4) is being cut now** — six containers coming up, the master dying on camera, and the promotion clock running in real time. Subscribing on **[Macstab Engineering](https://www.youtube.com/@MacstabEngineering)** is how you catch it.
 
 ---
 
 ## About the Author
 
-**Christian Schnapka** is a principal+ backend engineer with 30 years of experience in Java, C++, cloud, and hardcore backend architecture. He has been the technical lead in nearly every team he has joined — from embedded systems to large-scale distributed platforms.
+**Christian Schnapka** has spent 30 years on backend systems — Java, C++, cloud, and the architecture underneath all three. Embedded work at one end, large-scale distributed platforms at the other, and the technical lead role in very nearly every team along the way.
 
-He built the Macstab Chaos Stack because the combination he needed — call-specific libc faults, JVM-internal effects, real container topologies, and test-scoped PR regression gates — was not available in one coherent workflow. Manual reproduction is possible but difficult to repeat, while infrastructure chaos validates a different and complementary set of resilience properties.
+The Macstab Chaos Stack exists because no single workflow offered the four things he needed together: libc faults targeted at specific calls, effects reaching inside the JVM, container topologies that match production, and regression gates scoped tightly enough to run on a pull request. Reproducing these failures by hand is possible, but repeating them reliably is not — and infrastructure chaos, while genuinely useful, validates a different and complementary set of resilience properties.
 
 He publishes under **[Macstab](https://macstab.com)**, the company he works for.
 
-Current work: authorization platforms (OAuth2, Spring Authorization Server) and energy management systems (Spring Boot, React). Principal embedded developer. Lives in Wentorf bei Hamburg, Germany.
+These days the work is authorization platforms built on OAuth2 and Spring Authorization Server, and energy management systems in Spring Boot and React, alongside principal embedded development. Based in Wentorf bei Hamburg, Germany.
 
-Follow along:
+Where to find the rest of it:
 
 - **Website:** [macstab.com](https://macstab.com)
 - **YouTube:** [Macstab Engineering](https://www.youtube.com/@MacstabEngineering) — the chaos engineering series
